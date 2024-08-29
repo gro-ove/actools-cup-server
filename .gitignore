@@ -173,3 +173,15 @@ dist
 
 # Finder (MacOS) folder config
 .DS_Store
+
+# Some dev-related stuff
+.config.js
+backup
+bak
+bun.lockb
+compile.bat
+data
+dump.js
+res/cdn
+run.bat
+todo.txt

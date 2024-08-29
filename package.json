@@ -1,0 +1,11 @@
+{
+  "name": "actools-cup-server",
+  "module": "actools-cup-server.js",
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5.5.4"
+  },
+  "type": "module"
+}
