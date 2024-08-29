@@ -1,0 +1,12 @@
+.b2-file{position:relative;float:right;width:120px;height:15px;cursor:pointer;opacity:1;padding-top:20px;box-sizing:border-box;overflow:hidden}
+.b2-file:after{content:"🔼 Upload file directly";position:absolute;top:0;left:0;right:0;bottom:4px;text-align:center;z-index:1;font-size:0.8em;pointer-events:none;}
+.b2-file input{position:absolute;top:0;left:0;right:0;bottom:0;opacity:0;cursor:pointer;padding-top:20px}
+.b2-file+.row{margin-right:120px}
+.drag-highlight .b2-file:after{border:var(--text-color) 1px solid;border-radius:3px;top:0;bottom:3px;z-index:2}
+
+.modal-popup {position:fixed;top:0;left:0;bottom:0;right:0;background:rgba(127,127,127,0.5);z-index:999;display:flex;justify-content:center;align-items:center}
+.modal-popup>div{background:var(--bg);box-shadow:#000 0 4px 20px;border-radius:8px;padding:40px 80px}
+.modal-popup progress,.modal-popup button{width:100%}
+
+.popup-bg{display:none}
+.drag-highlight .popup-bg{display:block;background:rgba(127,127,127,0.5);position:fixed;bottom:0;right:0;top:0;left:0;z-index:1}
