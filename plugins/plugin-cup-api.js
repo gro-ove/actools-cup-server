@@ -33,7 +33,6 @@ function trigger($, categoryCupID, contentID, countColumn) {
   const contentData = JSON.parse(entry.contentData);
   if (!contentData.updateUrl) throw new RequestError(404);
   if (Hooks.poll('plugin.cup.put', `${$.req.url}/${$.req.headers.get('x-real-ip')}`)){
-    console.log(`TRIGGER: ${countColumn}`)
     db.query(`UPDATE ${DBTbl.Content} SET ${countColumn}=${countColumn}+1 WHERE contentKey=?1`).run(entry.contentKey);
   }
   return Hooks.poll('data.downloadURL.straighten', contentData.updateUrl) || contentData.updateUrl;

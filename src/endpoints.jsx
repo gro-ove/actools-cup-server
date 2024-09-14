@@ -12,9 +12,13 @@ Server.get('/manage', $ => {
 });
 
 // Commands:
-Server.post('/manage/command/undo', $ => {
-  return $.processUndo($.params.id);
+Server.post('/manage/command/logout', $ => {
+  return Hooks.poll('core.user.logout', $)
+    || jsExt.raiseError(new RequestError(401, 'Unauthorized', <script>{new BunJSX(`location.href=${JSON.stringify($.params.location || '/manage')}`)}</script>));
 });
+
+Server.post('/manage/command/undo', $ => $.processUndo());
+Server.post('/manage/command/undo-close', $ => $.clearUndo());
 
 Server.post('/manage/command/content-move', $ => {
   $.writes();
@@ -59,23 +63,19 @@ Server.post('/manage/command/group-delete', $ => {
   if (!targetGroup) return null;
   const mainGroup = db.query(`SELECT groupKey, groupID FROM ${DBTbl.Groups} WHERE userKey=?1 ${DBTbl.Groups.order()} LIMIT 1`).get($.user.userKey);
   if (mainGroup.groupKey == targetGroup.groupKey) throw $.requestError('Can’t delete the first group');
-  db.transaction(() => {
-    const ids = db.query(`SELECT contentKey FROM ${DBTbl.Content} WHERE groupKey=?1`).all(targetGroup.groupKey).map(x => x.contentKey);
-    db.query(`UPDATE ${DBTbl.Content} SET groupKey=?1 WHERE groupKey=?2`).run(mainGroup.groupKey, targetGroup.groupKey);
-    db.query(`DELETE FROM ${DBTbl.Groups} WHERE groupKey=?1`).run(targetGroup.groupKey);
-    $.undo(`Group ${targetGroup.name} removed.`, () => {
-      delete targetGroup.groupKey;
-      const newKey = DBTbl.Groups.insert(targetGroup);
-      for (const e of ids) {
-        db.query(`UPDATE ${DBTbl.Content} SET groupKey=?1 WHERE contentKey=?2`).run(newKey, e);
-      }
-    })
-  })();
-  return `/manage/group`;
-});
 
-Server.post('/manage/command/logout', $ => {
-  throw new RequestError(401, 'Unauthorized', <script>{new BunJSX(`location.href=${JSON.stringify($.params.location || '/manage')}`)}</script>);
+  using _ = db.write().start();
+  const ids = db.query(`SELECT contentKey FROM ${DBTbl.Content} WHERE groupKey=?1`).all(targetGroup.groupKey).map(x => x.contentKey);
+  db.query(`UPDATE ${DBTbl.Content} SET groupKey=?1 WHERE groupKey=?2`).run(mainGroup.groupKey, targetGroup.groupKey);
+  db.query(`DELETE FROM ${DBTbl.Groups} WHERE groupKey=?1`).run(targetGroup.groupKey);
+  $.undo(`Group ${targetGroup.name} removed.`, () => {
+    delete targetGroup.groupKey;
+    const newKey = DBTbl.Groups.insert(targetGroup);
+    for (const e of ids) {
+      db.query(`UPDATE ${DBTbl.Content} SET groupKey=?1 WHERE contentKey=?2`).run(newKey, e);
+    }
+  })
+  return `/manage/group`;
 });
 
 Server.post('/manage/command/user-change-password', $ => {
@@ -126,7 +126,7 @@ Server.get('/manage/group/:groupID', $ => {
     </ul><ul>
       <hr />
       <Co.InlineMenu>
-        <Co.Dropdown href="#" label="Add…">{ContentCategories.map(n => <Co.Link action={`/manage/group/${$.params.groupID}`} args={{ categoryID: n.id }} query={`New ${n.name} ${n.folder ? 'folder' : 'file without extension'} name (if there are several, list the first one):`}>Add {n.name}…</Co.Link>)}</Co.Dropdown>
+        <Co.Dropdown href="#" label="Add…">{ContentCategories.filter(x => !x.limited || $.user.allowedFilter === '.').map(n => <Co.Link action={`/manage/group/${$.params.groupID}`} args={{ categoryID: n.id }} query={`New ${n.name} ID (if there are several, list the first one):`}>Add {n.name}…</Co.Link>)}</Co.Dropdown>
         <Co.Link action="/manage/command/group-rename" args={{ groupID: $.params.groupID }} query="New name:" default={$.group.name}>Rename group…</Co.Link>
       </Co.InlineMenu>
     </ul>
@@ -136,7 +136,16 @@ Server.get('/manage/group/:groupID', $ => {
 Server.post('/manage/group/:groupID', $ => {
   $.writes();
   $.verifyID($.categoryIndex, $.id);
-  db.query(`INSERT INTO ${DBTbl.Content} (categoryIndex, contentID, groupKey, userKey, dataName) VALUES (?1, ?2, ?3, ?4, ?5)`).run($.categoryIndex, $.id, $.group.groupKey, $.user.userKey, $.params.value.replace(/_+/g, ' ').trim().replace(/\b\w/, _ => _.toUpperCase()));
+
+  using w = db.write();
+  const contentKey = w.query(`INSERT INTO ${DBTbl.Content} (categoryIndex, contentID, groupKey, userKey, dataName) VALUES (?1, ?2, ?3, ?4, ?5)`).run($.categoryIndex, $.id, $.group.groupKey, $.user.userKey, $.params.value.replace(/_+/g, ' ').trim()).lastInsertRowid;
+
+  if ($.userData.dataAuthor) w.query(`UPDATE ${DBTbl.Content} SET dataAuthor=?2 WHERE contentKey=?1`).run(contentKey, $.userData.dataAuthor);
+  if ($.userData.flagSearcheable) w.query(`UPDATE ${DBTbl.Content} SET flagSearcheable=true WHERE contentKey=?1`).run(contentKey);
+  if ($.userData.flagOriginal) w.query(`UPDATE ${DBTbl.Content} SET flagOriginal=true WHERE contentKey=?1`).run(contentKey);
+  if ($.userData.flagLimited) w.query(`UPDATE ${DBTbl.Content} SET flagLimited=true WHERE contentKey=?1`).run(contentKey);
+  if ($.userData.cleanInstallation) w.query(`UPDATE ${DBTbl.Content} SET contentData=?2 WHERE contentKey=?1`).run(contentKey, JSON.stringify({ cleanInstallation: true }));
+
   return `/manage/${$.params.categoryID}/${$.id}`;
 });
 
@@ -151,11 +160,11 @@ function authorSuggestions($, userKey) {
 
 Server.get('/manage/:categoryID/:contentID', $ => {
   $.user;
-  
+
   const entry = db.query(`SELECT * FROM ${DBTbl.Content} WHERE categoryIndex=?1 AND contentID=?2`).get($.categoryIndex, $.params.contentID);
   if (!entry) return null;
   const contentData = JSON.parse(entry.contentData);
-  const liveUpdating = $.liveUpdating(entry.flagsDisabled & DisabledFlag.PROCESSING ? 3 : 1, <>
+  const liveUpdating = $.liveUpdating(entry.flagsDisabled & DisabledFlag.PROCESSING ? 3 : 10, <>
     {(entry.flagsDisabled & DisabledFlag.BLOCKED)
       ? <li class="warn">Blocked: <Co.Value title={contentData.blockedReason ? `Reason: ${contentData.blockedReason}` : Locale.hints.blocked}>yes</Co.Value></li>
       : null}
@@ -255,16 +264,18 @@ Server.post('/manage/:categoryID/:contentID', $ => {
         db.query(`UPDATE ${DBTbl.Content} SET contentData=?2 WHERE contentKey=?1`).run(entry.contentKey, DBTbl.Content.encodeContentData(curData));
       }
     });
-    db.transaction(() => {
+    {
+      using _ = db.write().start();
       db.query(`DELETE FROM ${DBTbl.Content} WHERE contentKey=?1`).run(entry.contentKey);
       db.query(`DELETE FROM ${DBTbl.AlternativeIDs} WHERE contentKey=?1`).run(entry.contentKey);
-    })();
+    }
     Hooks.trigger('core.alteration', { categoryIndex: entry.categoryIndex, contentKey: entry.contentKey, invalidateList: true });
     Hooks.trigger('data.downloadURL.change', { $, key: `c${entry.contentKey}`, oldValue: curData.updateUrl, newValue: null });
     return `/manage/group/${db.query(`SELECT groupID FROM ${DBTbl.Groups} WHERE groupKey=?1`).get(entry.groupKey).groupID}`;
   }
 
-  db.transaction(() => {
+  {
+    using _ = db.write().start();
     // $.params['data-updateUrl'] = cleanURL($.params['data-updateUrl'])
 
     const newData = $.form({
@@ -335,13 +346,14 @@ Server.post('/manage/:categoryID/:contentID', $ => {
     if (newGroup) {
       db.query(`UPDATE ${DBTbl.Content} SET groupKey=?2 WHERE contentKey=?1`).run(entry.contentKey, newGroup.groupKey);
     }
-  })();
+  }
 
   if ($.params['data-alternativeIds'] != null) {
     const newIDs = [...new Set($.params['data-alternativeIds'].split(/[\n,]/).map(x => x.trim().toLowerCase()).filter(Boolean))].sort();
     const curIDs = db.query(`SELECT contentID FROM ${DBTbl.AlternativeIDs} WHERE contentKey=?1`).all(entry.contentKey).map(x => x.contentID).sort();
     if (!Bun.deepEquals(newIDs, curIDs)) {
-      db.transaction(() => {
+      {
+        using _ = db.write().start();
         for (const id of curIDs) {
           if (newIDs.includes(id)) continue;
           db.query(`DELETE FROM ${DBTbl.AlternativeIDs} WHERE categoryIndex=?1 AND contentID=?2`).run(entry.categoryIndex, id);
@@ -351,7 +363,7 @@ Server.post('/manage/:categoryID/:contentID', $ => {
           $.verifyID(entry.categoryIndex, id);
           db.query(`INSERT INTO ${DBTbl.AlternativeIDs} (contentKey, categoryIndex, contentID) VALUES (?1, ?2, ?3)`).run(entry.contentKey, entry.categoryIndex, id);
         }
-      })();
+      }
       Hooks.trigger('core.alteration', { categoryIndex: entry.categoryIndex, contentKey: entry.contentKey, invalidateList: true });
     }
   }
@@ -384,7 +396,7 @@ Server.get('/manage/tool/password', $ => {
   $.user;
   return <Co.Page title="Change password…">
     <Co.MainForm.Start autocomplete />
-    <ul class="form">
+    <ul class="form" $hook="core.tpl.changePasswordForm">
       <Co.Row key="pass0" attributes={{ type: 'password', autocomplete: 'current-password', required: true }}>Current password</Co.Row>
       <Co.Row key="pass1" attributes={{ type: 'password', autocomplete: 'new-password', required: true }}>New password</Co.Row>
       <Co.Row key="pass2" attributes={{ type: 'password', autocomplete: 'new-password', required: true }}>One more time</Co.Row>
@@ -399,12 +411,14 @@ Server.get('/manage/tool/password', $ => {
 Server.post('/manage/tool/password', $ => {
   if (!$.params['data-pass0'] || !$.params['data-pass1']) throw $.requestError('Please fill out the form');
   if ($.params['data-pass1'] !== $.params['data-pass2']) throw $.requestError('Passwords don’t match');
-  if ($.user.password !== DBTbl.Users.passEncode($.user.userID, $.params['data-pass0'])) throw $.requestError('Current password is invalid');
+  const password = db.query(`SELECT password FROM ${DBTbl.Users} WHERE userKey=?1`).get($.user.userKey)?.password;
+  if (password !== DBTbl.Users.passEncode($.user.userID, $.params['data-pass0'])) throw $.requestError('Current password is invalid');
+  Hooks.trigger('core.user.changingPassword', $);
   return db.query(`UPDATE ${DBTbl.Users} SET password=?1 WHERE userKey=?2`).run(DBTbl.Users.passEncode($.user.userID, $.params['data-pass1']), $.user.userKey).changes ? '/manage' : null;
 });
 
 const ProfileSettings = {
-  Editor({ user, userData, ctx$ }) {
+  Editor({ user, userData, ctx$, intro }) {
     const $ = ctx$;
     const contacts = userData.contacts || {};
     return <>
@@ -416,8 +430,9 @@ const ProfileSettings = {
       <Co.Row data={userData} key="dataAuthor" options={db.query(`SELECT dataAuthor, COUNT(*) AS count FROM ${DBTbl.Content} WHERE userKey=?1 GROUP BY dataAuthor ORDER BY count DESC`).all(user.userKey).map(x => x.dataAuthor)}>Author name</Co.Row>
       <Co.Row data={userData} key="flagLimited" default={false}>Limited</Co.Row>
       <Co.Row data={userData} key="cleanInstallation" default={false}>Clean installation</Co.Row>
-      {$.can(Access.FLAG_ORIGINAL) ? <Co.Row data={userData} key="flagOriginal" default={false}>Original content</Co.Row> : null}
-      {$.can(Access.FLAG_SEARCHEABLE) ? <Co.Row data={userData} key="flagSearcheable" default>Allow search</Co.Row> : null}
+      {$.can(Access.FLAG_ORIGINAL) ? <Co.Row data={userData} key="flagOriginal" default={false} forced-choice={intro}>Original content</Co.Row> : null}
+      {$.can(Access.FLAG_SEARCHEABLE) ? <Co.Row data={userData} key="flagSearcheable" default forced-choice={intro}>Allow search</Co.Row> : null}
+      <i $hook="core.tpl.userEditor">These settings are the ones used by default for new content entries. You can always change it for individual entries later.</i>
       <h3><span title="Just in case somebody would want to reach you (keep in mind, your contacts are publicly visible)">Contacts</span>:</h3>
       <Co.Row data={contacts} key="mail" attributes={{ type: 'email' }}>E-mail</Co.Row>
       <Co.Row data={contacts} key="steam">Steam</Co.Row>
@@ -468,7 +483,9 @@ const ProfileSettings = {
       const total = db.query(`SELECT c.contentID AS contentID, c.categoryIndex AS categoryIndex, GROUP_CONCAT(a.contentID, ", ") AS alternativeIds FROM ${DBTbl.Content} c LEFT JOIN ${DBTbl.AlternativeIDs} a ON c.contentKey = a.contentKey WHERE c.userKey=?1 GROUP BY c.contentID ${DBTbl.Content.order('c')}`).all(user.userKey);
       return <>
         <h3>Account access:</h3>
-        <Co.Row accessMask={user.accessMask}>Permissions</Co.Row>
+        {user.userKey !== ctx$.user.userKey
+          ? <Co.Row accessMask={user.accessMask}>Permissions</Co.Row>
+          : <li>Permissions: <Co.PermissionsList value={user.accessMask} /></li>}
         <Co.Row data={user} key="allowedFilter" attributes={{ class: 'mono', 'data-allowed-filter-ids': JSON.stringify(total.map(x => [x.contentID, ...(x.alternativeIds ? x.alternativeIds.split(', ') : [])].map(y => `${ContentCategories[x.categoryIndex].maskID}:${y}`)).flat().filter(Boolean)) }}>ID filter</Co.Row>
       </>;
     }
@@ -478,57 +495,57 @@ const ProfileSettings = {
     </>;
   },
   save($, userID) {
-    db.transaction(() => {
-      const user = db.query(`SELECT * FROM ${DBTbl.Users} WHERE userID=?1`).get(userID);
-      $.writes(user);
-      if (!user.introduced) {
-        db.query(`UPDATE ${DBTbl.Content} SET flagSearcheable=?2, flagOriginal=?3 WHERE userKey=?1`).run(user.userKey, $.params['data-flagSearcheable'] === 'on', $.params['data-flagOriginal'] === 'on');
-      }
-      if ($.params['data-allowedFilter'] != null && $.can(Access.MODERATE)) {
-        const newMask = Object.values(Access).filter(x => $.params[`perm-${x}`] === 'on').reduce((p, v) => p | v, 0);
-        if (newMask != user.accessMask) {
-          db.query(`UPDATE ${DBTbl.Content} SET accessMask=?2 WHERE userKey=?1`).run(user.userKey, newMask);
-          if (!(newMask & Access.FLAG_SEARCHEABLE) && (user.accessMask & Access.FLAG_SEARCHEABLE)) {
-            db.query(`UPDATE ${DBTbl.Content} SET flagSearcheable=false WHERE userKey=?1`).run(user.userKey);
-          }
-          if (!(newMask & Access.FLAG_ORIGINAL) && (user.accessMask & Access.FLAG_ORIGINAL)) {
-            db.query(`UPDATE ${DBTbl.Content} SET flagOriginal=false WHERE userKey=?1`).run(user.userKey);
-          }
+    using _ = db.write().start();
+    const user = db.query(`SELECT * FROM ${DBTbl.Users} WHERE userID=?1`).get(userID);
+    $.writes(user);
+    if (!user.introduced) {
+      db.query(`UPDATE ${DBTbl.Content} SET flagSearcheable=?2, flagOriginal=?3 WHERE userKey=?1`).run(user.userKey, $.params['data-flagSearcheable'] === 'on', $.params['data-flagOriginal'] === 'on');
+    }
+    if ($.params['data-allowedFilter'] != null && $.can(Access.MODERATE)) {
+      const newMask = Object.values(Access).filter(x => $.params[`perm-${x}`] === 'on' && $.canSetPermission(x)).reduce((p, v) => p | v, 0);
+      if (newMask != user.accessMask) {
+        db.query(`UPDATE ${DBTbl.Users} SET accessMask=?2 WHERE userKey=?1`).run(user.userKey, newMask);
+        if (!(newMask & Access.FLAG_SEARCHEABLE) && (user.accessMask & Access.FLAG_SEARCHEABLE)) {
+          db.query(`UPDATE ${DBTbl.Content} SET flagSearcheable=false WHERE userKey=?1`).run(user.userKey);
         }
-        if ($.params['data-allowedFilter'] !== user.allowedFilter) {
-          db.query(`UPDATE ${DBTbl.Users} SET allowedFilter=?1 WHERE userKey=?2`).run($.params['data-allowedFilter'], user.userKey);
+        if (!(newMask & Access.FLAG_ORIGINAL) && (user.accessMask & Access.FLAG_ORIGINAL)) {
+          db.query(`UPDATE ${DBTbl.Content} SET flagOriginal=false WHERE userKey=?1`).run(user.userKey);
         }
       }
-      db.query(`UPDATE ${DBTbl.Users} SET userData=?1, introduced=true WHERE userKey=?2`).run(JSON.stringify(Object.assign(JSON.parse(user.userData), {
-        profileName: $.params['data-profileName'] || null,
-        profileBio: $.params['data-profileBio'] || null,
-        profileUrl: $.params['data-profileUrl'] || null,
-        dataAuthor: $.params['data-dataAuthor'] || null,
-        contacts: {
-          mail: $.params['data-mail'] || null,
-          steam: $.params['data-steam'] || null,
-          discord: $.params['data-discord'] || null,
-          telegram: $.params['data-telegram'] || null,
-        },
-        flagLimited: $.params['data-flagLimited'] === 'on',
-        cleanInstallation: $.params['data-cleanInstallation'] === 'on',
-        flagOriginal: $.params['data-flagOriginal'] === 'on',
-        flagSearcheable: $.params['data-flagSearcheable'] === 'on',
-      })), user.userKey);
-    })();
+      if ($.params['data-allowedFilter'] !== user.allowedFilter) {
+        db.query(`UPDATE ${DBTbl.Users} SET allowedFilter=?1 WHERE userKey=?2`).run($.params['data-allowedFilter'], user.userKey);
+      }
+    }
+    db.query(`UPDATE ${DBTbl.Users} SET userData=?1, introduced=1 WHERE userKey=?2`).run(JSON.stringify(Object.assign(JSON.parse(user.userData), {
+      profileName: $.params['data-profileName'] || null,
+      profileBio: $.params['data-profileBio'] || null,
+      profileUrl: $.params['data-profileUrl'] || null,
+      dataAuthor: $.params['data-dataAuthor'] || null,
+      contacts: {
+        mail: $.params['data-mail'] || null,
+        steam: $.params['data-steam'] || null,
+        discord: $.params['data-discord'] || null,
+        telegram: $.params['data-telegram'] || null,
+      },
+      flagLimited: $.params['data-flagLimited'] === 'on',
+      cleanInstallation: $.params['data-cleanInstallation'] === 'on',
+      flagOriginal: $.params['data-flagOriginal'] === 'on',
+      flagSearcheable: $.params['data-flagSearcheable'] === 'on',
+    })), user.userKey);
   },
 }
 
 Server.get('/manage/introduction', $ => {
+  // $.user.introduced = false; // TODO
   if ($.user.introduced) return `/manage/user/${$.user.userID}`;
   return <Co.Page title={`Hello, ${$.userData.name || $.user.userID}`}>
     <ul class="form">
       <Co.MainForm.Start />
-      <p>Just a couple more things before we proceed. You can always change these values later.</p>
-      <ProfileSettings.Editor user={$.user} userData={$.userData} ctx$={$} />
+      <p $hook="core.tpl.introduction.message">Just a couple more things before we proceed. You can always change these values later.</p>
+      <ProfileSettings.Editor user={$.user} userData={$.userData} ctx$={$} intro={true} />
       <hr />
       <input type="hidden" name="redirect" value={$.params.redirect || ''} />
-      <Co.MainForm.End>Proceed</Co.MainForm.End>
+      <Co.MainForm.End>Save & continue</Co.MainForm.End>
     </ul>
   </Co.Page>;
 });
@@ -554,11 +571,8 @@ Server.get('/manage/user/:userID', $ => {
         <hr />
         <ProfileSettings.Editor user={user} userData={userData} ctx$={$} />
         <hr />
-        <Co.InlineMenu>
+        <Co.InlineMenu $hook={{ 'core.tpl.userPage.menu': { user } }}>
           <Co.MainForm.End>Save changes</Co.MainForm.End>
-          {$.can(Access.MODERATE)
-            ? <Co.Link href={`/manage/request/new?userID=${user.userID}`}>Contact user…</Co.Link>
-            : null}
           {$.can(Access.MODERATE)
             ? <Co.Link action="/manage/command/user-change-password" args={{ userID: user.userID }} query="New password:">Change password…</Co.Link>
             : <Co.Link href="/manage/tool/password">Change password…</Co.Link>}
@@ -590,7 +604,9 @@ Server.post('/manage/user/:userID', $ => {
 
 // Index page:
 Server.get('/', $ => new Response(formatGenericPage($, <Co.Page title="Hello World!" center>
-  <p>CUP is a solution for content creators to auto-update their content or add it to a searcheable registry for users to access.</p>
+  <G $hook="core.tpl.index.content">
+    <p>CUP is a solution for content creators to auto-update their content or add it to a searcheable registry for users to access.</p>
+  </G>
   <p>
     <Co.InlineMenu $hook="core.tpl.index.menu">
       <Co.Link href="/manage">CUP</Co.Link>
@@ -609,10 +625,10 @@ Server.get('/', $ => new Response(formatGenericPage($, <Co.Page title="Hello Wor
       return ((d, h) => new Response(d, h)).bind(null, Bun.deflateSync(data.join('\n')),
         { headers: { 'Content-Type': Bun.file('res/' + k).type, 'Cache-Control': 'max-age=604800, public', 'Content-Encoding': 'deflate' } });
     }
-    return () => new Response(Bun.file(k.startsWith('icon.') ? 'res/favicon.ico' : 'res/' + k), resArgs);
+    return () => new Response(Bun.file(k.startsWith('icon.') ? `${AppSettings.core.resDir}/favicon.ico` : `${AppSettings.core.resDir}/${k}`), resArgs);
   });
   if (AppSettings.core.monitorResources) {
-    fs.watch('res', { recursive: true }, () => filesCache.clear());
+    fs.watch(AppSettings.core.resDir, { recursive: true }, () => filesCache.clear());
   }
   Server.zone('/res', { handle: (req, url) => filesCache.get(url.pathname.substring(5))() });
   Server.get('/favicon.ico', $ => filesCache.get('favicon.ico')());

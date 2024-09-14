@@ -1,4 +1,4 @@
-:root{--bg:#fff;--input-bg:#eee;--accent-warn:#b00;--accent-good:#080;--text-color:#000;--link:#008;--separator:#0008;--table-odd:#7771}
+:root{--bg:#fff;--input-bg:#eee;--accent-warn:#b00;--accent-good:#080;--text-color:#000;--link:#008;--separator:#0008;--table-odd:#7771;--input-bg-opaque:var(--input-bg)}
 
 #dummy{display:none;}
 input,textarea,html{color:var(--text-color)}
@@ -11,12 +11,13 @@ form input.link{background:none;border:none;display:inline;padding:0;cursor:poin
 table,tr,th,td{font:inherit}
 h1 input{background:none;border:none;display:inline;padding:0;font:inherit}
 h1 input::placeholder{opacity:0.3}
+/* select[data-forced-choice]:required{ color:red } */
 th{font-weight:700;text-align:left}
 th:not(:first-child){padding-left:20px}
 td:not(:first-child){text-align:right}
 ul:empty:after{content:"<No entries>";opacity:0.5}
-.row input,.row textarea,.row select{margin:0;padding:0;border:none}
-.row input,.row textarea,form:not([data-immediate]) .row select{background:var(--input-bg);width:calc(100% - 168px)}
+.row input,.row textarea,.row select{margin:0;padding:0;border:none;box-sizing: border-box;}
+.row input,.row textarea,form:not([data-immediate]) .row select{background:var(--input-bg);width:calc(100% - 160px)}
 .row button{float:right;width:200px;height:16px;font-size:0.8em}
 .row input,.row textarea{padding:0 4px;vertical-align:top}
 .row input[readonly]{background:none}
@@ -28,7 +29,7 @@ label.for:after, label[for]:not(.inline2):after{content:": "}
 label.for, label[for]:not(.inline2)[data-changed=true]:after{content:"*: "}
 label.inline2[data-changed=true]:after{content:none;font-style:italic}
 label.inline2{margin-left:4px;margin-right:8px}
-a[data-selected],form input.link[data-selected]{font-weight:bold}
+a[data-selected],form input.link[data-selected],span[data-selected]{font-weight:bold}
 li.details{font-size:1.25em}
 li.details>div{margin:4px 0 8px;font-size:0.8em}
 .undo{position:fixed;left:40px;bottom:40px;background:var(--input-bg);z-index:10;padding:20px}
@@ -36,15 +37,20 @@ li.details>div{margin:4px 0 8px;font-size:0.8em}
 a{text-decoration:none}
 span[title],a[title],input.link[title],li[title] span{text-decoration:underline dashed}
 span[title]:after,a[title]:after,li[title] span:after{content:"?";font-size:0.6em;vertical-align:top}
-label.inline,label.inline2{ width:auto}
+label.inline,label.inline2{width:auto}
+
 /* select{background-color:var(--bg);color:inherit} */
-select{margin:0;padding:0;border:none;background-color:var(--input-bg);color:inherit}
+select{margin:0;padding:0;border:none;background-color:var(--input-bg);color:var(--text-color)}
+select option,select optgroup{background-color:var(--input-bg-opaque);color:var(--text-color)}
+select option:disabled{background-color:color-mix(in srgb, var(--input-bg-opaque) 80%, var(--text-color) 20%)}
+select:invalid,::placeholder {color:rgb(from var(--text-color) r g b / 0.4)}
 .placeholder,li[data-disabled],tr[data-disabled] td,tr[data-disabled]+.details td{opacity:0.5}
 li[data-errored],tr[data-errored] td,tr[data-errored]+.details td{color:var(--accent-warn)}
 .mono{font-family:monospace;padding:2px 8px;margin:-2px 0;background:var(--input-bg);text-decoration:none;display:inline-block}
 li+hr,ul>div+hr{margin-top:10px}
-[data-input-result]{position:relative}
-[data-input-result]:after{content:attr(data-input-result);display:block;font-size:0.8em;position:absolute;right:0;top:0;bottom:0;pointer-events:none;text-align:right;text-wrap:nowrap;text-overflow:ellipsis;overflow:hidden;padding:0 8px;color:color-mix(in srgb, var(--bg) 25%, var(--text-color) 75%)}
+li,[data-input-result]{position:relative}
+[data-input-result]:after{content:attr(data-input-result);display:block;font-size:0.8em;position:absolute;right:0;top:0;bottom:0;pointer-events:none;text-align:right;text-wrap:nowrap;text-overflow:ellipsis;overflow:hidden;padding:0 8px;color:color-mix(in srgb, var(--bg) 25%, var(--text-color) 75%);max-width:calc(100% - 300px);text-overflow:ellipsis}
+.password-toggle{position:absolute;right:8px;top:0;bottom:0;z-index:1;color:var(--text-color);font-size:0.8em;line-height:16px;cursor:pointer}
 .link,[data-input-result^="❌"]:after{color:var(--accent-warn)}
 .good,[data-input-result^="✔"]:after{color:var(--accent-good)}
 .checkboxes nobr input{margin:0; padding:0}
@@ -69,6 +75,7 @@ th{position:relative;cursor:pointer}
 [data-sort="0"]:after{content:'↓';position:absolute;margin-left:4px;margin-top:-1px}
 blockquote{white-space:pre-wrap}
 [data-online]:before{content:"•";padding-right:0.3em;display:inline-block;color:var(--accent-good)}
+input:-webkit-autofill,input:-webkit-autofill:focus{-webkit-box-shadow:0 0 0 1px var(--accent-good), 0 0 0 10px var(--bg) inset;-webkit-text-fill-color:var(--text-color);}
 
 .dropdown{position:relative}
 .dropdown a{cursor:pointer}
@@ -81,9 +88,23 @@ blockquote{white-space:pre-wrap}
 .dropdown-content[data-dropdown-align-right]>span>a:after{content:"◀";float:left;margin-left:-16px}
 [data-checked]:before{content:"◀";float:left;margin-left:-16px}
 
+.text-trim{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:block}
+li[data-marker]::marker{content:attr(data-marker)}
+[data-compact-list]{padding-left:20px}
+[data-compact-list] li::marker{content:none}
+
 .dropdown>div>a,.dropdown>div>span,.dropdown>div input{padding:4px 20px}
 .dropdown>div form{margin:0}
 .header-right{float:right}
+/* .side{float:left;height:fill-available} */
+
+.layout-side{display:flex;flex-direction:row;}
+.layout-side>div{flex:5}
+.layout-side>:last-child{flex:1;min-width:160px}
+
+.task-list{padding-left:20px}
+.task-list .task-list-item::marker{content:none}
+.task-list-item input{pointer-events:none}
 
 hr{flex-grow:1;width:100%}
 body{margin:12px 20px}

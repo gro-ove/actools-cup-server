@@ -1,8 +1,11 @@
 /** Basic thing to quickly import data from CUP v1. */
 
-import { Access, ContentUtils, db, DBTbl, DisabledFlag, Hooks, Utils } from '../src/app';
+import { Access, ContentUtils, db, DBTbl, DisabledFlag, Hooks, pluginSettings, Utils } from '../src/app';
 
 const { inj, titlefy } = Utils;
+const Settings = pluginSettings('importV1', {
+  verbose: false
+});
 
 function categoryFromV1(v1) {
   return v1.startsWith('car__') ? 0 : v1.startsWith('track__') ? 1 : v1.startsWith('app__') ? 4 : null;
@@ -14,20 +17,20 @@ async function importV1(importDir) {
   const tryRead = (filename, fallback) => { try { return '' + fs.readFileSync(filename); } catch (e) { return fallback; } };
   for (const [username, params] of Object.entries(JSON.parse(await Bun.file(`${importDir}/users.json`).text()))) {
     const ustats = fs.statSync(`${importDir}/users.json`);
-    const userKey = db.query(`INSERT INTO ${DBTbl.Users} (userID, password, accessMask, introduced, createdDate, lastSeenDate) VALUES (?1, ?2, ?3, ?4, ?5, ?5);`).run(username, DBTbl.Users.passEncode(username, params.password), params.access.users === 'full' ? Access.ADMIN : Access.REGULAR, params.access.users === 'full', ustats.mtime / 1e3).lastInsertRowid;
+    const userKey = db.query(`INSERT INTO ${DBTbl.Users} (userID, password, accessMask, introduced, createdDate, lastSeenDate) VALUES (?1, ?2, ?3, ?4, ?5, ?5);`).run(username, DBTbl.Users.passEncode(username, params.password), params.access.users === 'full' ? Access.ADMIN : Access.REGULAR, params.access.users === 'full' ? 1 : 0, ustats.mtime / 1e3).lastInsertRowid;
 
     let groupDate = Date.now() / 1e3 | 0;
     const mainGroupKey = db.query(`INSERT INTO ${DBTbl.Groups} (userKey, groupID, name, createdDate) VALUES (?1, ?2, ?3, ?4)`).run(userKey, 'main', 'Main', groupDate++).lastInsertRowid;
     try {
       // if (username !== 'x4fab') continue;
 
-      console.log(`Importing ${username} (${userKey})…`);
+      if (Settings.verbose) console.log(`Importing ${username} (${userKey})…`);
       const items = fs.readdirSync(`${importDir}/user_${username}/content`).map(x => ({ id: x, content: fs.readdirSync(`${importDir}/user_${username}/content/${x}`, '*.json').map(y => ({ id: path.basename(y, '.json').split('__', 2)[1], categoryIndex: categoryFromV1(y), filename: `${importDir}/user_${username}/content/${x}/${y}` })).filter(y => y.categoryIndex != null) }));
 
       const ids = items.map(x => x.content.map(y => y.id)).flat();
       const prefixes = ids.map(x => /^([a-z]{2,4}_)/.test(x) ? RegExp.$1 : null).filter(x => x);
       if (ids.length > 1 && ids.length == prefixes.length && prefixes.every(x => x == prefixes[0])) {
-        console.log(`\tClean prefix: ${prefixes[0]}`);
+        if (Settings.verbose) console.log(`\tClean prefix: ${prefixes[0]}`);
         db.query(`UPDATE ${DBTbl.Users} SET allowedFilter=?1 WHERE userKey=?2`).run(`^.:${prefixes[0]}.+`, userKey);
       } else {
       //   const requestKey = db.query(`INSERT INTO p_requests (userKey, initialUserKey, message, unseenByModerator, unseenByUser) VALUES (?1, ?2, ?3, ?4, ?5)`).run(userKey, userKey, `Messy IDs for a mask: ${ids.join(', ') || '<nothing>'}\nTest1: car peugeot_504, https://google.com`, 1, 0).lastInsertRowid;
@@ -88,7 +91,7 @@ async function importV1(importDir) {
         }
       }
     } catch (e) {
-      console.warn(`\tFailed to import categories: ${e.stack} (user: ${username})`);
+      if (Settings.verbose) console.warn(`  Failed to import categories: ${e.stack} (user: ${username})`);
     }
   }
 }

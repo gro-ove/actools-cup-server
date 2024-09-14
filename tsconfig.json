@@ -1,0 +1,9 @@
+{
+  "compilerOptions": {
+    "jsx": "react",
+    "jsxFactory": "JsxFactory",
+    "outDir": "./built",
+    "allowJs": true,
+    "target": "es2022"
+  }
+}

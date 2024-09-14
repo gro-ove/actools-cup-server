@@ -1,5 +1,5 @@
 .b2-file{position:relative;float:right;width:120px;height:15px;cursor:pointer;opacity:1;padding-top:20px;box-sizing:border-box;overflow:hidden}
-.b2-file:after{content:"🔼 Upload file directly";position:absolute;top:0;left:0;right:0;bottom:4px;text-align:center;z-index:1;font-size:0.8em;pointer-events:none;}
+.b2-file:after{content:"🔼 Upload file directly";position:absolute;top:0;left:0;right:0;bottom:4px;text-align:center;font-size:0.8em;pointer-events:none;}
 .b2-file input{position:absolute;top:0;left:0;right:0;bottom:0;opacity:0;cursor:pointer;padding-top:20px}
 .b2-file+.row{margin-right:120px}
 .drag-highlight .b2-file:after{border:var(--text-color) 1px solid;border-radius:3px;top:0;bottom:3px;z-index:2}

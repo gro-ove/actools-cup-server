@@ -4,11 +4,21 @@ async function processMessages() {
   return new Promise(setTimeout);
 }
 
+function isZip(data) {
+  const dataView = new DataView(data);
+  return dataView.byteLength > 4 && dataView.getUint32(0) === 0x504b0304;
+}
+
 function loadFileChecksum(file, progressListener) {
   return new Promise((resolve, reject) => {
     var reader = new FileReader();
     reader.onerror = reject;
     reader.onload = async function () {
+      if (!isZip(this.result)) {
+        reject('Please use ZIP archive to ensure reliable content scanning and installation');
+        return;
+      }
+      // this.result.
       const hash = sha1.create();
       for (let i = 0, t = Date.now(); i < this.result.byteLength; i += 64 * 1024) {
         hash.update(this.result.slice(i, i + 64 * 1024));
@@ -96,9 +106,11 @@ async function updateB2Status(target) {
   }
 }
 
+let unfocusedSkip = 0;
 async function updateAllB2Status(force) {
   try {
-    if (document.hasFocus() || force === true) {
+    if (document.hasFocus() || --unfocusedSkip < 0 || force === true) {
+      unfocusedSkip = 100;
       for (const e of document.querySelectorAll('[data-b2-target]')) {
         await updateB2Status(e);
       }
@@ -201,7 +213,7 @@ document.querySelectorAll('[data-b2-file]').forEach(input => {
               url: '/api/plugin-b2/large-file',
               data: file.slice(ret.next * ret.chunk, (ret.next + 1) * ret.chunk),
               headers: Object.assign({ 'X-Chunk-Index': ret.next }, headers),
-              progressListener: ev => pr.report(ev.loaded === ev.total && ret.next + 1 === ret.total 
+              progressListener: ev => pr.report(ev.loaded === ev.total && ret.next + 1 === ret.total
                 ? { message: `Waiting for server to process the data…` } : progress.get(ev.loaded)),
               cancellableListener: fn => pr.cancellable(fn)
             });
@@ -218,7 +230,7 @@ document.querySelectorAll('[data-b2-file]').forEach(input => {
           url: '/api/plugin-b2/file',
           headers: { 'X-File-Name': file.name.replace(/[^a-z0-9!~_.-]/ig, '') || 'unnamed.bin', 'X-File-Checksum': checksum },
           data: file,
-          progressListener: ev => pr.report(ev.loaded === ev.total 
+          progressListener: ev => pr.report(ev.loaded === ev.total
             ? { message: `Waiting for server to process the data…` } : progress.get(ev.loaded)),
           cancellableListener: fn => pr.cancellable(fn)
         });

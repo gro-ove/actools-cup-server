@@ -1,6 +1,7 @@
 /** Main app state. Now packed into a single file to make it easier to add new plugins. */
 
-import { BunJSX, ExtendedDatabase, LazyMap, Mediator, PerfCounter, PromiseReuser, Router } from './std';
+import { BunJSX, CookieHandler, ExtendedDatabase, fsExt, jsExt, LazyMap, Mediator, NumberEncoder, PerfCounter, prepareAsset, PromiseReuser, Router, Timer } from './std';
+import { AsyncLocalStorage } from 'node:async_hooks';
 
 // Some consts
 export const AppSettings = {
@@ -10,6 +11,8 @@ export const AppSettings = {
     httpPort: 8080,
     passwordSalt: 'salt',
     monitorResources: false,
+    dataDir: './data',
+    resDir: './res',
     cdnCacheDir: './res/cdn',
   },
 
@@ -21,8 +24,8 @@ export const AppSettings = {
 
   // Delays in seconds
   periods: {
-    undoLifespan: 4 * 60 * 60, // Time for which undo data is kept
-    seenFor: 30, // Once seen, keep track of a user for this time
+    undoLifespan: '4h', // Time for which undo data is kept
+    seenFor: '30min', // Once seen, keep track of a user for this time
   },
 
   ownContacts: {
@@ -30,15 +33,19 @@ export const AppSettings = {
   },
 
   plugins: {
-    active: []
+    active: [],
+    verbose: true
   },
 };
 
+fsExt.mkdirPSync(AppSettings.core.dataDir);
+fsExt.mkdirPSync(AppSettings.core.cdnCacheDir);
+
 // Some basic helper functions.
 export const Utils = {
-  uid() { return require('crypto').randomBytes(16).toString('base64').replace(/^\d|\W/g, '').slice(0, 8) || 'wtf'; },
+  uid(length = 8) { return require('crypto').randomBytes(length * 4).toString('base64').replace(/^\d|\W/g, '').slice(0, length) || this.uid(); },
   inj(v) { return v; },
-  idfy(value) { return value.toLowerCase().replace(/[^\w_. -]+/g, '').substring(0, 80); },
+  idfy(value, lowerCase) { return (lowerCase ? value.toLowerCase() : value).replace(/[^\w_. -]+/g, '').substring(0, 80); },
   titlefy(value) { return value && value.replace(/^./, _ => _.toUpperCase()); },
   plural(x, c) { return c === 1 ? x : x.endsWith('y') ? x.substring(0, x.length - 1) + 'ies' : x + 's' },
   deepAssign(t, s) { return s ? Object.entries(s).reduce((p, [k, v]) => ((p[k] = typeof v === 'object' && typeof p[k] === 'object' ? this.deepAssign(p[k], v) : v), p), t) : t; },
@@ -109,8 +116,8 @@ export const Utils = {
       try {
         return await fn(i === 1 ? '' : ` (attempt ${i}/${tries})`);
       } catch (e) {
-        if (e instanceof RequestError) throw e;
-        if (e && e.message === 'Try again' && tries < 6) ++tries;
+        if (e && e.repeat) tries += (typeof e.repeat === 'number' ? e.repeat : 0);
+        else throw e;
         console.warn(e);
       }
     }
@@ -159,7 +166,7 @@ export const Locale = {
 
     blocked: 'Might happen if entry receives too many complains',
     hidden: 'Entry is hidden due to some configuration errors',
-    processing: 'Entry is being processed now and will become available once ready',
+    processing: 'Entry is being processed and will become available once ready',
     active: 'Uncheck to hide entry from updates and search',
     dataName: 'Optional name',
     dataAuthor: 'Optional author field',
@@ -171,7 +178,7 @@ export const Locale = {
 
     flagLimited: 'Check if you want update URL to open in system browser instead of starting the update (useful for paid mods)',
     cleanInstallation: 'If selected, clean update option will be selected by default',
-    flagSearcheable: 'Allow users to find it if it’s not installed',
+    flagSearcheable: 'Allow users to find your content, add mods to CM Workshop and similar platforms',
     flagOriginal: 'Please check only if model hasn’t been taken from a different videogame or something like that (applies to cars, tracks or showrooms)',
   }
 }
@@ -196,12 +203,15 @@ export const AccessPermissions = [
   { id: 'original flag', flag: Access.FLAG_ORIGINAL, hint: 'Mark content AS original (please do not ports with this flag)' },
   { id: 'searcheable flag', flag: Access.FLAG_SEARCHEABLE, hint: 'Mark content AS appearing in search and other lists' },
   { id: 'direct uploads', flag: Access.BACKBLAZE, hint: 'Upload archives directly to CUP backend' },
-  { id: 'moderate', flag: Access.MODERATE, hint: 'Do anything you want, really' },
+  { id: 'moderate', flag: Access.MODERATE, hint: 'Do anything you want, really', hidden: true },
+  { id: 'admin', flag: Access.ADMIN, hint: 'And also, mess with CUP panel settings', hidden: true },
 ];
 
 // Extra details about permissions
 export const AccessPermissionShortenings = {
   [Access.REGULAR]: [{ id: 'regular', hint: 'Regular access' }],
+  [Access.REGULAR | Access.BACKBLAZE]: [{ id: 'regular+b2', hint: 'Regular access with direct uploads' }],
+  [Access.REGULAR | Access.BACKBLAZE | Access.MODERATE]: [{ id: 'moderator', hint: 'Full access apart from panel alteration' }],
   [Access.ADMIN]: [{ id: 'admin', hint: 'Full unrestricted access' }],
 };
 
@@ -219,8 +229,8 @@ export const ContentCategories = [
   { id: 'track', cupID: 'track', maskID: 't', name: 'track', title: 'Track', portable: true, folder: true },
   { id: 'showroom', cupID: 'showroom', maskID: 's', name: 'showroom', title: 'Showroom', portable: true, folder: true },
   { id: 'filter', cupID: 'filter', maskID: 'f', name: 'PP filter', title: 'PP filter', portable: false, folder: false },
-  { id: 'python', cupID: 'app', maskID: 'p', name: 'Python app', title: 'Python app', portable: false, folder: true },
-  { id: 'lua', cupID: 'lua', maskID: 'l', name: 'Lua app', title: 'Lua app', portable: false, folder: true },
+  { id: 'python', cupID: 'app', maskID: 'p', name: 'Python app', title: 'Python app', portable: false, folder: true, limited: true },
+  { id: 'lua', cupID: 'lua', maskID: 'l', name: 'Lua app', title: 'Lua app', portable: false, folder: true, limited: true },
 ];
 
 // Hooks holder for server logic to allow plugins to alter the behavior
@@ -306,10 +316,10 @@ BunJSX.configure({
     $hook: (v, b) => {
       // BunJSX templates can easily trigger hook events
       if (typeof v === 'string') {
-        Hooks.trigger(v, b, cur$);
+        Hooks.trigger(v, b, curCtx.get());
       } else {
         for (const k in v) {
-          Hooks.trigger(k, b, v[k], cur$);
+          Hooks.trigger(k, b, v[k], curCtx.get());
         }
       }
     }
@@ -317,7 +327,7 @@ BunJSX.configure({
 });
 
 // Core stuff to deal with databases
-export const db = new ExtendedDatabase(AppSettings.core.dbFileName);
+export const db = new ExtendedDatabase(`${AppSettings.core.dataDir}/${AppSettings.core.dbFileName}`);
 Utils.deepAssign(AppSettings, db.storage.get('adminSettings'));
 
 /** @template {any} T @param {string} key @param {T} defaults @param {null|(data: T) => T} editable @return {T} */
@@ -338,7 +348,7 @@ export const DBTbl = {
     password: db.row.text(),
     accessMask: db.row.integer(),
     allowedFilter: db.row.text({ nullable: true }),
-    introduced: db.row.boolean({ default: false }),
+    introduced: db.row.integer({ default: 0 }),
     userData: db.row.text({ default: '{}' }),
   }, {
     order: `ORDER BY ?userID`,
@@ -424,7 +434,7 @@ export const DBTbl = {
 Hooks.register('data.downloadURL.referencedURL', ({ key }) => {
   if (!/^c(\d+)$/.test(key)) return;
   const entry = db.query(`SELECT categoryIndex, contentID, dataName FROM ${DBTbl.Content} WHERE contentKey=?1`).get(+RegExp.$1 | 0);
-  return entry && <Co.Link href={`/manage/${ContentCategories[entry.categoryIndex].id}/${entry.contentID}`}>{entry.dataName}</Co.Link>;
+  return entry && <Co.Link href={`/manage/${ContentCategories[entry.categoryIndex].id}/${entry.contentID}`}>{ContentCategories[entry.categoryIndex].name} {entry.dataName || entry.contentID}</Co.Link>;
 });
 
 Hooks.register('data.downloadURL.state', ({ key, processing, errorMsg }) => {
@@ -444,16 +454,22 @@ Hooks.register('data.downloadURL.state', ({ key, processing, errorMsg }) => {
 });
 
 // An internal thingy to keep track of current request context within JSX and JSX components
-let cur$;
+
+const curCtx = {
+  ctxStorage: new AsyncLocalStorage(),
+  /** @return {Ctx} */
+  get() { return this.ctxStorage.getStore(); },
+  set($, fn) { return this.ctxStorage.run($, fn); },
+};
 
 // Helper class for endpoints given to them as request context, handles some common HTML templates.
 const categoryIDToIndex = ContentCategories.reduce((p, v, k) => ((p[v.id] = k), p), {});
 
 const undoData = new Map();
-setInterval(() => Utils.filterMap(undoData, (k, v) => v.date > Date.now()), AppSettings.periods.undoLifespan * 100);
+setInterval(() => Utils.filterMap(undoData, (k, v) => v.date > Date.now()), Timer.ms(AppSettings.periods.undoLifespan) * 0.1);
 
 const recentlySeen = new Map();
-setInterval(() => Utils.filterMap(recentlySeen, (k, v) => v > Date.now()), AppSettings.periods.seenFor * 100);
+setInterval(() => Utils.filterMap(recentlySeen, (k, v) => v > Date.now()), Timer.ms(AppSettings.periods.seenFor) * 0.1);
 
 function conflictContactsMenu(userID, contentID) {
   const data = db.query(`SELECT userData FROM ${DBTbl.Users} WHERE userID=?1`).get(userID);
@@ -464,13 +480,19 @@ function conflictContactsMenu(userID, contentID) {
 }
 
 const formatStats = new PerfCounter();
+const cookieEncoder = new NumberEncoder('!#$%&\'()*+-./:<=>?@[]^_`{|}~0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz');
 
 export class Ctx {
-  /** @param {Request} req @param {import('url').Url} url @param {table<string, string>} params */
-  constructor(req, url, params) {
+  /** @param {Request} req @param {import('url').Url} url @param {import('bun').Server} server @param {table<string, string>} params */
+  constructor(req, url, server, params) {
     this.req = req;
     this.url = url;
+    this.server = server;
     this.params = params;
+  }
+
+  get requestIP() {
+    return this.__requestIP || (this.__requestIP = (this.req.headers.get('x-forwarded-for') || this.server.requestIP(this.req)?.address || 'unknown').replace(/^::ffff:/, ''));
   }
 
   get onlineUserIDs() {
@@ -485,6 +507,10 @@ export class Ctx {
     return formatStats;
   }
 
+  get cookies() {
+    return this.__cookies || (this.__cookies = new CookieHandler(this.req));
+  }
+
   isUserOnline(userID) {
     return recentlySeen.has(userID);
   }
@@ -495,12 +521,16 @@ export class Ctx {
 
   can(level = 1) {
     if (level && typeof level === 'object') return level.userKey === this.user.userKey && this.can(Access.EDIT) || this.can(Access.MODERATE);
-    return level != null && (this.user.accessMask & level) !== 0;
+    return level != null && (this.user.accessMask & level) === level;
   }
 
   writes(level = 1) {
     if (level == null) throw new RequestError(404);
     if (!this.can(level)) throw this.requestError('Permission denied');
+  }
+
+  canSetPermission(level) {
+    return this.can(Access.ADMIN) || AccessPermissions.some(x => x.flag === level && !x.hidden);
   }
 
   /** @template {any} T @param {T} fields @return {T} */
@@ -520,8 +550,8 @@ export class Ctx {
 
   verifyID(categoryIndex, contentID) {
     const args = {};
-    if (contentID !== Utils.idfy(contentID)) {
-      throw this.requestError('ID can only contain latin symbols, digits, “_”, “-“, “.“ or spaces',
+    if (contentID !== Utils.idfy(contentID, true)) {
+      throw this.requestError('ID can only contain lowercase latin symbols, digits, “_”, “-“, “.“ or spaces',
         <Co.Link feedback={`I want to use ${ContentCategories[categoryIndex].id}/${contentID} as ID`}>Ask for a change of rules…</Co.Link>);
     }
     try {
@@ -539,12 +569,17 @@ export class Ctx {
     const allowedFilter = this.__allowedFilter || (this.__allowedFilter = db.query(`SELECT allowedFilter FROM ${DBTbl.Users} WHERE userKey = ?1`).get(this.user.userKey).allowedFilter);
     if (allowedFilter && !new RegExp(allowedFilter).test(`${ContentCategories[categoryIndex].maskID}:${contentID}`)) {
       throw this.requestError('Sorry, but currently you don’t have permission to use such ID',
-        <Co.Link feedback={`I want to register ${ContentCategories[categoryIndex].id}/${contentID}`}>Request access…</Co.Link>);
+        <Co.Link feedback={`I want to register ${ContentCategories[categoryIndex].id} ${contentID}`}>Request access…</Co.Link>);
     }
+    if (!allowedFilter && ContentCategories[categoryIndex].limited) {
+      throw this.requestError('Sorry, but currently you don’t have permission to register this type of content',
+        <Co.Link feedback={`I want to register ${ContentCategories[categoryIndex].id} ${contentID}`}>Request access…</Co.Link>);
+    }
+    Hooks.trigger('core.verifyID', { categoryIndex, contentID, $: this });
   }
 
   get id() {
-    return this.__id ?? (this.__id = Utils.idfy(this.params.value) || 'unnamed');
+    return this.__id ?? (this.__id = Utils.idfy(this.params.value, true) || 'unnamed');
   }
 
   get categoryIndex() {
@@ -552,18 +587,29 @@ export class Ctx {
   }
 
   get signed() {
-    return this.req.headers.get('authorization') != null;
+    let user = Hooks.poll('core.user.signedCheck', this);
+    return user !== undefined ? user : this.req.headers.get('authorization') != null;
+  }
+
+  get requiredUserFields() {
+    return `userKey, userID, createdDate, lastSeenDate, accessMask, allowedFilter, introduced`
   }
 
   /** @returns {{userID: string, userKey: integer}} */
   get user() {
     if (!this.__user) {
-      const auth = Buffer.from((this.req.headers.get('authorization') || '').split(' ', 2)[1] || '', 'base64').toString('utf-8').split(':');
-      const user = db.query(`SELECT userKey, userID, createdDate, lastSeenDate, password, accessMask, allowedFilter, introduced FROM ${DBTbl.Users} WHERE userID=?1`).get(auth[0]);
+      let user = Hooks.poll('core.user.auth', this);
+      if (user === undefined) {
+        const auth = Buffer.from((this.req.headers.get('authorization') || '').split(' ', 2)[1] || '', 'base64').toString('utf-8').split(':');
+        user = db.query(`SELECT ${this.requiredUserFields}, password FROM ${DBTbl.Users} WHERE userID=?1`).get(auth[0]);
+        if (user.password !== DBTbl.Users.passEncode(auth[0], auth[1])) user = null;
+      }
+
       Hooks.trigger('core.user', user, this);
-      if (!user || user.password !== DBTbl.Users.passEncode(auth[0], auth[1])) {
+      // if (user) user.introduced = 0;
+      if (!user) {
         this.header('WWW-Authenticate', 'Basic realm=manage, charset="UTF-8"');
-        throw new RequestError(401, 'Unauthorized', <Co.Page title="Please authorize" center>
+        throw new RequestError(401, 'Unauthorized', <Co.Page title="Authorization required" center>
           <p>This web-panel allows content creators to register new updates for their mods for Assetto Corsa.</p>
           <p>If you want to access it, please contact us and we’ll create a profile for you. To speed things up, please list prefixes you are using for your folder names if any, or folder names of mods you wish to update.</p>
           <p>
@@ -579,9 +625,9 @@ export class Ctx {
         throw new RequestError(302, 'Unintroduced', new BunJSX(''));
       } else {
         this.__user = user;
-        recentlySeen.set(user.userID, Date.now() + AppSettings.periods.seenFor * 1e3);
-        if (Date.now() > user.lastSeenDate * 1e3 + 10e3) {
-          user.lastSeenDate = Date.now() / 1e3;
+        recentlySeen.set(user.userID, Timer.timestamp(AppSettings.periods.seenFor));
+        if (+db.value.now > user.lastSeenDate + 10) {
+          user.lastSeenDate = +db.value.now;
           db.query(`UPDATE ${DBTbl.Users} SET lastSeenDate=?2 WHERE userKey=?1`).run(user.userKey, +db.value.now);
         }
       }
@@ -624,18 +670,22 @@ export class Ctx {
   }
 
   undo(title, cb) {
-    const k = Utils.uid();
-    undoData.set(k, { date: Date.now() + AppSettings.periods.undoLifespan * 1e3, url: this.params.location || this.req.headers.get('referrer') || this.url.pathname, cb });
-    this.header('Set-Cookie', `UndoToken=${JSON.stringify(`${k}/${title}`)};  Max-Age:0; Path=/`);
+    undoData.set(this.user.userKey, { title, date: Timer.timestamp(AppSettings.periods.undoLifespan), url: this.params.location || this.req.headers.get('referrer') || this.url.pathname, cb });
   }
 
-  processUndo(id) {
-    const e = undoData.get(id);
-    this.header('Set-Cookie', 'UndoToken=; Max-Age:0; Path=/');
+  processUndo() {
+    const e = undoData.get(this.user.userKey);
     if (!e) throw this.requestError('Action to undo is gone, unfortunately you’ll have to revert changes manually');
-    undoData.delete(id);
-    db.transaction(() => e.url = e.cb(this) || e.url)();
+    undoData.delete(this.user.userKey);
+    {
+      using _ = db.write().start();
+      e.url = e.cb(this) || e.url;
+    }
     return e.url;
+  }
+
+  clearUndo() {
+    return new Response(null, { status: undoData.delete(this.user.userKey) ? 204 : 404 });
   }
 
   constructResponse(body, headers, status) {
@@ -646,16 +696,18 @@ export class Ctx {
 
   /** @template {any} T @param {number} period @param {T} pieces @returns {T} */
   liveUpdating(period, ...pieces) {
-    if (this.req.headers.get('X-Live-Update')) {
+    if (this.req.headers.has('X-Live-Update')) {
       throw this.constructResponse(pieces.join('\0'), { 'Content-Type': 'text/html; charset=UTF-8', 'Cache-Control': 'no-store' });
     }
-    return pieces.map((x, i) => <div data-live-update={period}>{x}</div>);
+    return pieces.map((x, i) => <div data-live-update={Timer.seconds(period)}>{x}</div>);
   }
 }
 
+const marked = jsExt.install('marked3', (marked, markdownData) => marked(markdownData, { silent: true }));
+
 export const Co = {
   Page(props, body) {
-    cur$.currentTitle = ('' + props.title).replace(/<.+?>/g, '');
+    curCtx.get().currentTitle = (Array.isArray(props.title) ? props.title.join('') : '' + props.title).replace(/<.+?>/g, '');
     if (props.center) {
       return <div class="center">
         <h1 data-page-search={props.search}>{props.title}</h1>
@@ -668,31 +720,44 @@ export const Co = {
     </>
   },
 
+  Markdown(props, body) {
+    return <div style={props.style}>{new BunJSX(marked.ready() ? marked(props.content) : Bun.escapeHTML(props.content))}</div>;
+  },
+
   FormattedMessage(props, body) {
     if (!props.value) return null;
     let msg = props.value;
     if (props['single-line']) msg = msg.split('\n', 2)[0].trim() + '…';
     if (props['max-length'] && msg.length > props['max-length']) msg = msg.substring(0, props['max-length']) + '…';
-    return msg ? new BunJSX(Bun.escapeHTML(msg)
-      .replace(/\b(car|track|showroom|filter|python|lua|user) ([\w.-]+)\b/g, (_, c, i) => `<a href="/manage/${c}/${i}">${_}</a>`)
-      .replace(/\bhttps?:\/\/\S+?(?=$| |[.,!?] )/g, _ => `<a href="${_}">${_}</a>`)) : null;
+    return msg ? new BunJSX(Hooks.trigger('core.formatMessage', {
+      message: Bun.escapeHTML(msg)
+        .replace(/\b(car|track|showroom|filter|python|lua|user) ([\w.-]+)\b/g, (_, c, i) => `<a href="/manage/${c}/${i}">${_}</a>`)
+        .replace(/\bhttps?:\/\/\S+?(?=$| |[.,!?] )/g, _ => `<a href="${_}">${_}</a>`)
+    }).message) : null;
   },
 
   Date(props) {
-    const d = new Date(props.value * 1e3);
-    const y = Date.now() - +d;
-    return <span data-timestamp-title={d.toISOString()}>{y < 15e3 ? 'now' : Utils.age(y / (24 * 60 * 60e3), props.short) + (props.short ? '' : ' ago')}</span>;
+    try {
+      const d = new Date(props.value * 1e3);
+      const y = Date.now() - +d;
+      // return <span data-timestamp-title={d.toISOString()}>{y < 15e3 ? 'now' : Utils.age(y / (24 * 60 * 60e3), props.short) + (props.short ? '' : ' ago')}</span>;
+      return <span data-timestamp-title={d.toISOString()}>{y < 5e3 ? 'now' : Utils.age(y / (24 * 60 * 60e3), props.short) + (props.short ? '' : ' ago')}</span>;
+    } catch {
+      return <span>Invalid date: {props.value || '<none>'}</span>;
+    }
   },
 
   PermissionsList(props) {
-    const list = props.short && AccessPermissionShortenings[props.value] || AccessPermissions.filter(x => x.hint && (x.flag & props.value) == x.flag);
+    const list = props.short && AccessPermissionShortenings[props.value]
+      || AccessPermissions.filter(x => x.hint && (x.flag & props.value) == x.flag && (!x.hidden || curCtx.get().can(Access.ADMIN)));
     return new BunJSX(list.map(x => <Co.Value title={x.hint}>{x.id}</Co.Value>).join(', ')
       || `<span class="placeholder">&lt;none&gt;</span>`);
   },
 
   UserURL(props) {
+    if (!props.userID && !props.userKey) return <Co.Value placeholder="unknown user" />;
     const id = props.userID || DBTbl.Users.userID(props.userKey);
-    return <a href={`/manage/user/${id}`} data-selected={id === cur$.__user?.userID} data-online={!props['hide-online-mark'] && recentlySeen.has(id)}>{id}</a>;
+    return <a href={`/manage/user/${id}`} data-selected={id === curCtx.get().__user?.userID} data-online={!props['hide-online-mark'] && recentlySeen.has(id)}>{id}</a>;
   },
 
   Value(props, body) {
@@ -712,7 +777,11 @@ export const Co = {
 
   MainForm: {
     Start(props) {
-      return new BunJSX(props.autocomplete ? '<form method=POST autocomplete=on>' : '<form method=POST>');
+      let r = '<form method=POST';
+      if (props.autocomplete) r += ' autocomplete=on';
+      if (props.action) r += ` action="${Bun.escapeHTML(props.action)}"`;
+      if (props.multipart) r += ` enctype="multipart/form-data"`;
+      return new BunJSX(r + '>');
     },
     End(props, body) {
       return new BunJSX(<input class="link good" type="submit" value={body} /> + `</form>`);
@@ -722,28 +791,51 @@ export const Co = {
   Link(props, body) {
     const title = props.title ? Locale.hints[props.title] || props.title : null;
     if (props.action) {
-      let url = props.action;
       const list = props.args && Object.entries(props.args).filter(([k, v]) => Array.isArray(v))[0];
-      const args = props.args && Object.entries(props.args).map(([k, v]) => Array.isArray(v) ? null : <input type="hidden" name={k} value={v === 'current' && k === 'location' ? cur$.url.pathname : v === true ? '1' : v} />);
+      const args = props.args && Object.entries(props.args).reduce((p, [k, v]) => (Array.isArray(v) ? null
+        : (p[k] = v === 'current' && k === 'location' ? curCtx.get().url.pathname : v), p), {}) || {};
+
+      let url = props.action;
+      if (typeof url === 'function') {
+        if (!Co.__linkActions) {
+          Co.__linkActions = new Map();
+          Server.post(`/manage/command/lambda/:lambdaID`, $ => {
+            if (Bun.sha(`${$.user.accessMask}:${$.params.lambdaID}`, 'base64') !== $.params._ctx) throw $.requestError('Permission denied');
+            const e = Co.__linkActions.get($.params.lambdaID);
+            return e ? (e($) || '/~') : null;
+          });
+        }
+        const k = Bun.hash(url).toString(36);
+        if (!Co.__linkActions.has(k)) {
+          console.log('New lambda action', url.toString(), k);
+          Co.__linkActions.set(k, url);
+        }
+        url = `/manage/command/lambda/${k}`;
+        args._ctx = Bun.sha(`${curCtx.get().user.accessMask}:${k}`, 'base64');
+      }
+
+      const argsInput = Object.keys(args).length === 0 ? null
+        : <input type="hidden" name="_args" value={JSON.stringify(args)} />;
+
       if (list) {
         const k = Utils.uid();
         return <form action={url} method="POST" data-immediate data-live-apply={props['data-live-apply']}>
           <label class="inline" for={k}>{body}</label>
           <select id={k} name={list[0]}>{list[1].map(x => <option value={x.value} selected={!!x.selected}>{x.name}</option>)}</select>
-          {args}
+          {argsInput}
         </form>;
       }
       return <form action={url} method="POST" data-form={props.query} data-form-argument={props.default} data-live-apply={props['data-live-apply']}>
         {props.query ? <input type="hidden" name="value" /> : null}
-        {args}
-        <input type="submit" class="link" value={body} title={title} data-selected={props['data-selected']} />
+        {argsInput}
+        <input type="submit" class={props.good ? `link good` : `link`} value={body} title={title} data-selected={props['data-selected']} />
       </form>;
     }
 
     const h = props.feedback
       ? Hooks.poll('core.feedbackURL', props.feedback) || `mailto:${AppSettings.ownContacts.mail}?subject=${encodeURIComponent(`CUP: ${props.feedback}`)}`
       : props.href;
-    return h ? <a href={h} title={title} data-selected={h === cur$.url.pathname || props['data-selected']}>{body}</a> : body;
+    return h ? <a href={h} title={title} data-selected={h === curCtx.get().url.pathname || props['data-selected']}>{body}</a> : body;
   },
 
   SocialLinks(props, body) {
@@ -761,7 +853,7 @@ export const Co = {
       return <li>
         <div class="checkboxes">
           <label class="for">{body}<input id="dummy" /></label>
-          {AccessPermissions.map(x => <nobr><input id={`perm-${x.flag}`} name={`perm-${x.flag}`} type="checkbox" checked={(props.accessMask & x.flag) !== 0} /><label class="inline2" for={`perm-${x.flag}`}><span title={x.hint}>{x.id}</span></label></nobr>)}
+          {AccessPermissions.map(x => (!x.hidden || curCtx.get().can(Access.ADMIN)) ? <nobr><input id={`perm-${x.flag}`} name={`perm-${x.flag}`} type="checkbox" checked={(props.accessMask & x.flag) === x.flag} /><label class="inline2" for={`perm-${x.flag}`}><span title={x.hint}>{x.id}</span></label></nobr> : null)}
         </div>
       </li>
     }
@@ -775,7 +867,18 @@ export const Co = {
     if (props.required) inh.required = true;
     let input;
     if (typeof props.default === 'boolean') {
-      input = <input $attr={inh} type="checkbox" checked={data[key] == null ? props.default : !!data[key]} />;
+      if (props['forced-choice']) {
+        delete inh.value;
+        input = <select $attr={inh} required data-forced-choice>
+          <option disabled selected value="" hidden>Select an option…</option>
+          <optgroup label="Please select:">
+            <option value="on">Yes</option>
+            <option value="off">No</option>
+          </optgroup>
+        </select>;
+      } else {
+        input = <input $attr={inh} type="checkbox" checked={data[key] == null ? props.default : !!data[key]} />;
+      }
     } else if (props.multiline) {
       input = <textarea $attr={inh}>{data[key]}</textarea>;
     } else if (props.options) {
@@ -794,7 +897,7 @@ export const Co = {
 
 Hooks.register('core.tpl.userMenu', body => {
   if (!body.some(x => /data-selected/.test(x))) {
-    body.filter(x => x.content).forEach(x => x.content = x.content.replace(/<a href="([^"]+)"/g, (_, u) => cur$.url.pathname.startsWith(u) ? `${_} data-selected` : _));
+    body.filter(x => x.content).forEach(x => x.content = x.content.replace(/<a href="([^"]+)"/g, (_, u) => curCtx.get().url.pathname.startsWith(u) ? `${_} data-selected` : _));
   }
 }, Infinity);
 
@@ -818,55 +921,65 @@ class Zone {
     throw new Error(`Zone “${this.__prefix}” without defined finalize function can’t handle raw responses`);
   }
 
-  /** @param {Request} req @param {URL} url */
-  async handle(req, url) {
+  /** @param {Request} req @param {URL} url @param {import('bun').Server} server */
+  handle(req, url, server) {
     if (this.perf) this.perf.start();
 
     const params = {};
-    const $ = new Ctx(req, url, params);
-    if (this.prepare) await this.prepare($);
+    const $ = new Ctx(req, url, server, params);
 
-    cur$ = $;
-    process.nextTick(() => cur$ = null);
-    console.log(`Serving ${req.method} ${req.url}…`);
+    return curCtx.set($, async () => {
+      // console.log(`Serving ${req.method} ${req.url}…`);
 
-    let data;
-    try {
-      const found = router.get(req.method, url.pathname, params);
-      if (found) {
-        data = await found($);
-      }
-    } catch (e) {
-      if (e instanceof Response) {
-        return e;
-      } else {
-        collectError(e, $);
-        if (e instanceof RequestError) {
-        console.log(`  RequestError: ${e.code}`);
-          data = e.code === 404 ? null : e;
+      let data;
+      try {
+        if (this.prepare) await this.prepare($);
+        const found = router.get(req.method, url.pathname, params);
+        if (found) {
+          data = await found($);
+        }
+      } catch (e) {
+        if (e instanceof Response) {
+          return e;
         } else {
-          console.warn(`  Error: ${e.stack || e}`);
-          data = e
+          collectError(e, $);
+          if (e instanceof RequestError) {
+            console.log(`  RequestError: ${e.code}`);
+            data = e.code === 404 ? null : e;
+          } else {
+            console.warn(`  Error: ${e.stack || e}`);
+            data = e
+          }
         }
       }
-    }
 
-    if (typeof data === 'string' && data.startsWith('/')) {
-      console.log(`  Redirect: ${data}`);
-      if ($.params.location) {
-        data = $.params.location;
-      } else {
-        const r = redirects.get(data);
-        if (r) data = r($);
+      if (typeof data === 'string' && data.startsWith('/')) {
+        // console.log(`  Redirect: ${data}`);
+        if ($.params.location) {
+          data = $.params.location;
+        } else {
+          const r = redirects.get(data);
+          if (r) {
+            try {
+              data = r($);
+            } catch (e) {
+              console.warn(`Redirect error (${data}): ${e.stack}`);
+            }
+          }
+        }
+        if (data === url.pathname && req.method === 'GET') throw new Error(`Invalid redirect: ${data}`);
+        if (data === '/~') data = req.headers.get('referer');
+        data = new Response(null, { status: 302, headers: { 'Location': data } });
+      } else if (!(data instanceof Response)) {
+        data = this.finalize($, data, data instanceof RequestError ? data.code : data instanceof Error ? 500 : data != null ? data === '' ? 204 : 200 : 404, this.headers);
       }
-      if (data === url.pathname && req.method === 'GET') throw new Error(`Invalid redirect: ${data}`);
-      data = new Response(null, { status: 302, headers: Object.assign({ 'Location': data }, $.__headers) });
-    } else if (!(data instanceof Response)) {
-      data = this.finalize($, data, data instanceof RequestError ? data.code : data instanceof Error ? 500 : data != null ? data === '' ? 204 : 200 : 404, this.headers ? $.__headers ? Object.assign($.__headers, this.headers) : this.headers : $.__headers);
-    }
 
-    if (this.perf) this.perf.consider(url.pathname);
-    return data;
+      for (const key in $.__headers) data.headers.set(key, $.__headers[key]);
+      CookieHandler.apply($.__cookies, data);
+      // console.log(`${$.req.method} ${req.url.pathname}`, $.__cookies);
+      if (this.perf) this.perf.consider(url.pathname);
+      return data;
+    });
   }
 
   /** @return {Zone} */
@@ -891,7 +1004,7 @@ export const Server = {
   /** @param {($: Ctx) => string} callback */
   put(path, callback) { router.on('PUT', path, callback); },
   /** @param {($: Ctx) => string} callback */
-  del(path, callback) { router.on('DELETE', path, callback); },
+  delete(path, callback) { router.on('DELETE', path, callback); },
   /** @param {($: Ctx) => string} callback */
   redirect(path, callback) { redirects.set(path, callback); },
 
@@ -916,9 +1029,9 @@ export async function appStart() {
   await Hooks.async('core.starting.async');
   Bun.serve({
     port: AppSettings.core.httpPort,
-    async fetch(req) {
+    async fetch(req, server) {
       const url = new URL(req.url);
-      return Zone.find(url.pathname).handle(req, url);
+      return Zone.find(url.pathname).handle(req, url, server);
     },
     error(error) {
       console.warn(error);
@@ -930,12 +1043,14 @@ export async function appStart() {
   await Hooks.async('core.started.async');
   if (AppSettings.admin && AppSettings.admin.userID
     && db.query(`SELECT COUNT(*) as count FROM ${DBTbl.Users} WHERE userID=?1`).get(AppSettings.admin.userID).count === 0) {
-    const userKey = db.query(`INSERT INTO ${DBTbl.Users} (userID, password, accessMask, introduced) VALUES (?1, ?2, ?3, true);`).run(AppSettings.admin.userID, DBTbl.Users.passEncode(AppSettings.admin.userID, AppSettings.admin.password || ''), Access.ADMIN).lastInsertRowid;
+    const userKey = db.query(`INSERT INTO ${DBTbl.Users} (userID, password, accessMask, introduced) VALUES (?1, ?2, ?3, true);`).run(AppSettings.admin.userID, DBTbl.Users.passEncode(AppSettings.admin.userID, AppSettings.admin.password || ''), Access.ADMIN ? 1 : 0).lastInsertRowid;
     db.query(`INSERT INTO ${DBTbl.Groups} (userKey, groupID, name) VALUES (?1, ?2, ?3)`).run(userKey, 'main', 'Main');
   } else if (db.query(`SELECT COUNT(*) as count FROM ${DBTbl.Users} WHERE accessMask = ?1`).get(Access.ADMIN).count === 0) {
     console.warn(`No admin account detected, use configuration file to set credentials and restart the service.`);
   }
 }
+
+const assetsVersion = Utils.uid();
 
 /** @param {Ctx} $ */
 export function formatGenericPage($, data) {
@@ -962,10 +1077,9 @@ export function formatGenericPage($, data) {
       ? data instanceof RequestError
         ? data.options instanceof BunJSX
           ? data.options
-          : <Co.Page title="Request error" center>
+          : <Co.Page title="Can’t do" center>
             <ul class="form">
-              <h3>Couldn’t process the request:</h3>
-              <li>{data.body}.</li>
+              <p>{data.body}.</p>
               {data.options ? <><hr /><Co.InlineMenu>{data.options}</Co.InlineMenu></> : null}
             </ul>
           </Co.Page>
@@ -975,7 +1089,14 @@ export function formatGenericPage($, data) {
       : data || <Co.Page title="Not found" center><p>Requested resource does not exist.</p></Co.Page>
   };
   Hooks.trigger('core.tpl.final', final, $, $.__user);
-  return `<!DOCTYPE html><html><head><title>${final.title}</title><link rel="stylesheet" href="/res/style.css"/><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="shortcut icon" type="image/x-icon" href="/res/icon.ico" sizes="16x16"/><link rel="icon" type="image/x-icon" href="/res/icon.png" sizes="16x16"/><link rel="apple-touch-icon-precomposed" href="/res/icon.png"/>${$.__head ? [...$.__head.values()].join('') : ''}</head><body><noscript>Your browser does not support JavaScript, some features won’t function as intended.</noscript>${final.header}<main>${final.body}</main><div class=popup-bg></div><script src="/res/script.js"></script>${$.__foot ? [...$.__foot.values()].join('') : ''}</body></html>`;
+  return `<!DOCTYPE html><html><head><title>${final.title}</title><link rel="stylesheet" href="/res/style.css?v=${assetsVersion}"/><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="shortcut icon" type="image/x-icon" href="/res/icon.ico" sizes="16x16"/><link rel="icon" type="image/x-icon" href="/res/icon.png" sizes="16x16"/><link rel="apple-touch-icon-precomposed" href="/res/icon.png"/>${$.__head ? [...$.__head.values()].join('') : ''}</head><body><noscript>Your browser does not support JavaScript, some features won’t function as intended.</noscript>${final.header}<main>${final.body}</main><div class=popup-bg></div><script src="/res/script.js?v=${assetsVersion}"></script>${$.__foot ? [...$.__foot.values()].join('') : ''}</body></html>`;
+}
+
+function assignWeak(target, obj) {
+  for (const [key, value] of obj) {
+    if (key === '_args') assignWeak(target, Object.entries(JSON.parse(value)));
+    else if (target[key] === undefined) target[key] = value;
+  }
 }
 
 // Three main zones: root, /api and /manage:
@@ -983,7 +1104,7 @@ Server.zone('/', null);
 Server.zone('/api', {
   headers: { 'Content-Type': 'application/json; charset=UTF-8', 'Cache-Control': 'no-store' },
   finalize($, data, status, headers) {
-    console.log(`API request: ${$.req.method} ${$.req.url} → ${JSON.stringify(data)}`);
+    // console.log(`API request: ${$.req.method} ${$.req.url} → ${JSON.stringify(data)}`);
     return new Response(JSON.stringify(data instanceof Error ? { error: data instanceof RequestError && data.message || data.code || data } : data), { status, headers });
   }
 });
@@ -991,23 +1112,34 @@ Server.zone('/manage', {
   perf: formatStats,
   headers: { 'Content-Type': 'text/html; charset=UTF-8', 'Cache-Control': 'no-store' },
   async prepare($) {
-    if ($.req.method[0] === 'P' && $.req.headers.get('content-type')?.startsWith('application/x-www-form-urlencoded')) {
-      for (const [key, value] of await $.req.formData()) {
-        if (!$.params[key]) $.params[key] = value;
+    if ($.req.method[0] === 'P') {
+      const h = $.req.headers.get('content-type');
+      if (h && (h.startsWith('application/x-www-form-urlencoded') || h.startsWith('multipart/form-data'))) {
+        if ($.req.headers.get('content-length') > 4 * 1024 * 1024) throw $.requestError(`Too much information`);
+        $.requestIP;
+        assignWeak($.params, await $.req.formData());
       }
     }
 
-    for (const [key, value] of $.url.searchParams) {
-      if (!$.params[key]) $.params[key] = value;
-    }
+    assignWeak($.params, $.url.searchParams);
 
-    const C = $.req.headers.get('cookie');
-    if (C && /\bUndoToken="([^\/]+)\/([^"]+)"/.test(C) && !undoData.has(RegExp.$1)) {
-      $.header('Set-Cookie', 'UndoToken=; Max-Age:0; Path=/');
+    const u = $.__user && undoData.get($.__user.userKey);
+    if (u) {
+      $.foot(<>
+        <div class="undo">
+          <Co.InlineMenu>
+            {u.title}
+            <Co.Link action="/manage/command/undo" good>Undo</Co.Link>
+            <Co.Link action="/manage/command/undo-close" data-live-apply="this.closest('.undo').remove()">Close</Co.Link>
+          </Co.InlineMenu>
+        </div>
+        <script>{`fixPage(document.querySelector('.undo'))`}</script>
+      </>);
     }
   },
   finalize($, data, status, headers) {
     if (!data && $.signed) $.user;
+    if ($.req.headers.has('X-Live-Update')) return new Response(null, { status: 404 });
     return $.constructResponse(formatGenericPage($, data), headers, status);
   },
 });
@@ -1020,7 +1152,7 @@ export function resolveCDN(url) {
 };
 
 Server.zone('/cdn', {
-  ready: new Map(), 
+  ready: new Map(),
   reuser: new PromiseReuser(),
   async handle(req, url) {
     let data = this.ready.get(url.pathname);

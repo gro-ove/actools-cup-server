@@ -7,7 +7,7 @@ import { Access, Co, ContentCategories, db, DBTbl, DisabledFlag, Hooks, Server }
 Hooks.register('core.tpl.userMenu', (menu, $) => $.can(Access.VIEW) && menu.push(<>
   <hr />
   <Co.Link href='/manage/overview'>Overview</Co.Link>
-  <Co.Link href='/manage/user'>Users ({$.onlineUsersCount} online)</Co.Link>
+  <Co.Link href='/manage/user'>Users ({$.onlineUsersCount} online)</Co.Link>
 </>), 1);
 
 function stateLabel(x) {

@@ -1,9 +1,16 @@
 /** Some advanced moderation tools. */
-import { Access, AppSettings, Co, db, Hooks, RequestError, resolveCDN, Server, Utils } from '../src/app';
+import { Access, AppSettings, Co, db, Hooks, pluginSettings, RequestError, resolveCDN, Server, Utils } from '../src/app';
 import { heapStats } from "bun:jsc";
 import { PerfCounter } from '../src/std';
 
 const KEY_MAINTENANCE_MODE = 'plugin.admin.maintanence';
+const KEY_PAUSE_ERRORS_COLLECTION = 'plugin.admin.pauseErrorsCollection';
+
+const Settings = pluginSettings('admin', {
+  errorReportsLimit: 100
+}, s => ({
+  errorReportsLimit: s.errorReportsLimit
+}));
 
 const tblErrors = db.table('t_collected_errors', {
   url: db.row.text({ nullable: true }),
@@ -13,13 +20,15 @@ const tblErrors = db.table('t_collected_errors', {
 });
 
 Hooks.register('core.error', ({ error, $ }) => {
-  if (tblErrors.count() > 100 || error instanceof RequestError) return;
+  if (tblErrors.count() > Settings.errorReportsLimit
+    || db.storage.get(KEY_PAUSE_ERRORS_COLLECTION) === true
+    || error instanceof RequestError) return;
   tblErrors.insert({
     url: $?.req?.url,
-    userID: $?.__user?.userID, 
+    userID: $?.__user?.userID,
     data: `${error && error.stack || error}\n
 Method: ${$?.req?.method || '?'}
-Headers: ${$?.req?.headers && JSON.stringify([...$.req.headers.keys()].reduce((p, x) => ((p[x] = $.req.headers.get(x)), p), {}), null, 2)}`, 
+Headers: ${$?.req?.headers && JSON.stringify([...$.req.headers.keys()].reduce((p, x) => ((p[x] = $.req.headers.get(x)), p), {}), null, 2)}`,
     createdDate: Date.now() / 1e3
   });
 });
@@ -56,7 +65,7 @@ function errCount($) {
 
 Hooks.register('core.tpl.userMenu.header', (header, $) => $.user.accessMask === Access.ADMIN && errCount($) && (header.splice(0, Infinity, <>📛 {header[1]}</>)), 1e3);
 
-Hooks.register('core.tpl.userMenu', (menu, $) => $.user.accessMask === Access.ADMIN ? menu.push(<>
+Hooks.register('core.tpl.userMenu', (menu, $) => $.user.accessMask === Access.ADMIN ? menu.push(<G $hook="plugin.admin.tpl.userMenu">
   <hr />
   {db.storage.get(KEY_MAINTENANCE_MODE) ? <Co.Link action='/manage/cup/tool/maintanence'>{'Disable maintanence mode'}</Co.Link> : null}
   {errCount($) ? <Co.Link href='/manage/cup/errors'>Errors ({errCount($)})</Co.Link> : null}
@@ -65,7 +74,19 @@ Hooks.register('core.tpl.userMenu', (menu, $) => $.user.accessMask === Access.AD
     <Co.Link href='/manage/cup/tool'>Tools</Co.Link>
     <Co.Link href='/manage/cup/settings'>Settings</Co.Link>
   </Co.Dropdown>
-</>) : null, 100);
+</G>) : null, 100);
+
+Server.get('/manage/cup', $ => {
+  $.writes(Access.MODERATE);
+  return <Co.Page title="CUP">
+    <ul class="form">
+      <li><Co.Link href='/manage/cup/errors'>Errors ({errCount($)})</Co.Link></li>
+      <li><Co.Link href='/manage/cup/report'>Status</Co.Link></li>
+      <li><Co.Link href='/manage/cup/tool'>Tools</Co.Link></li>
+      <li><Co.Link href='/manage/cup/settings'>Settings</Co.Link></li>
+    </ul>
+  </Co.Page>;
+});
 
 Server.get('/manage/cup/tool', $ => {
   $.writes(Access.MODERATE);
@@ -77,7 +98,7 @@ Server.get('/manage/cup/tool', $ => {
       }
       <hr />
       <h3>Tools:</h3>
-      <Co.List>
+      <Co.List $hook="plugin.admin.tpl.toolsList">
         <Co.Link action='/manage/cup/tool/maintanence'>{db.storage.get(KEY_MAINTENANCE_MODE) ? 'Disable maintanence mode' : 'Enable maintanence mode'}</Co.Link>
         <Co.Link action='/manage/cup/tool/gc'>Run GC</Co.Link>
         <Co.Link action='/manage/cup/tool/dbgc'>Vacuum database and truncate WAL</Co.Link>
@@ -162,13 +183,6 @@ Server.get('/manage/cup/settings', $ => {
   </Co.Page>;
 });
 
-Server.post('/manage/command/plugin-admin-remove-error', $ => {
-  console.log($.params);
-  if ($.params.url) db.query(`DELETE FROM ${tblErrors} WHERE url=?1`).run($.params.url);
-  else db.query(`DELETE FROM ${tblErrors} WHERE createdDate=?1`).run($.params.createdDate);
-  return '/manage/cup/errors';
-});
-
 Server.get('/manage/cup/errors', $ => {
   $.writes(Access.ADMIN);
   const list = $.liveUpdating(30, <ul class="form">
@@ -177,13 +191,30 @@ Server.get('/manage/cup/errors', $ => {
         <Co.Date value={x.createdDate} />
         {x.url ? <Co.Link href={x.url}>{x.url.replace(/^[^\/]+\/\/[^\/]+\//, '/')}</Co.Link> : null}
         {x.userID ? <Co.UserURL userID={x.userID} /> : null}
-        <Co.Link action="/manage/command/plugin-admin-remove-error" args={{ createdDate: x.createdDate }} data-live-apply>remove</Co.Link>
-        {x.url ? <Co.Link action="/manage/command/plugin-admin-remove-error" args={{ url: x.url }} data-live-apply>remove by URL</Co.Link> : null}
+        <Co.Link action={$ => {
+          db.query(`DELETE FROM ${tblErrors} WHERE createdDate=?1`).run($.params.createdDate);
+        }} args={{ createdDate: x.createdDate }} data-live-apply>remove</Co.Link>
+        {x.url ? <Co.Link action={$ => {
+          db.query(`DELETE FROM ${tblErrors} WHERE url=?1`).run($.params.url);
+        }} args={{ url: x.url }} data-live-apply>remove by URL</Co.Link> : null}
       </Co.InlineMenu>
       <pre class="details">{x.data}</pre>
     </li>)}
   </ul>);
-  return <Co.Page title="Errors" search>{list[0]}</Co.Page>;
+  return <Co.Page title="Errors" search>
+    <ul class="form">
+      <Co.InlineMenu>
+        <Co.Link action={() => {
+          db.storage.set(KEY_PAUSE_ERRORS_COLLECTION, !db.storage.get(KEY_PAUSE_ERRORS_COLLECTION));
+        }}>{db.storage.get(KEY_PAUSE_ERRORS_COLLECTION) ? `Enable errors collection` : `Disable errors collection`}</Co.Link>
+        <Co.Link action={() => {
+          db.query(`DELETE FROM ${tblErrors}`).run();
+        }} query="Are you sure to remove all error reports?" data-live-apply>Clear out everything…</Co.Link>
+      </Co.InlineMenu>
+      <hr />
+    </ul>
+    {list[0]}
+  </Co.Page>;
 });
 
 Server.post('/manage/cup/settings', $ => {

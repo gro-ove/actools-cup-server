@@ -1,11 +1,11 @@
 /** Core plugin for public CUP API: stores data in CUP format in its own database, keeps track of recent counter increments. */
 
-import { LazyMap, PerfCounter } from '../src/std';
-import { ContentCategories, ContentUtils, db, DBTbl, DisabledFlag, Hooks, pluginSettings } from '../src/app';
+import { LazyMap, PerfCounter, Timer } from '../src/std';
+import { Access, Co, ContentCategories, ContentUtils, db, DBTbl, DisabledFlag, Hooks, pluginSettings, Server } from '../src/app';
 
 const Settings = pluginSettings('cup', {
-  dataRefresh: 3, // Check for changes and refresh publicly available data 
-  reportCooldown: 30, // Download and complain counters won’t increment from the same user until cooldown is reached
+  dataRefresh: '5s', // Check for changes and refresh publicly available data 
+  reportCooldown: '30s', // Download and complain counters won’t increment from the same user until cooldown is reached
 }, s => ({ dataRefresh: s.dataRefresh, reportCooldown: s.reportCooldown }));
 
 /**
@@ -17,7 +17,7 @@ const Settings = pluginSettings('cup', {
  * + Flags `false`, empty lists or strings do not show up in the output
  */
 
-const tplPuts = db.table('p_puts', {
+const tblPuts = db.table('p_puts', {
   originKey: db.row.integer({ primary: true }),
   createdDate: db.row.integer({ default: db.value.now, index: true }),
 });
@@ -27,13 +27,23 @@ const tblCupData = db.table('p_cupdata', {
   value: db.row.text(),
 });
 
+Hooks.register('plugin.admin.tpl.toolsList', body => {
+  body.push(<Co.Link action='/manage/cup/tool/cup-reset'>Reset CUP syncing</Co.Link>);
+});
+
+Server.post('/manage/cup/tool/cup-reset', $ => {
+  $.writes(Access.MODERATE);
+  Hooks.trigger('plugin.cup.reset');
+  return `/manage/cup/tool`;
+});
+
 const rebuildStats = new PerfCounter();
 
 Hooks.register('plugin.admin.stats', fn => fn({
   ['CUP syncing']: rebuildStats
 }));
 
-Hooks.register('plugin.cup.put', key => key && db.query(`INSERT OR IGNORE INTO ${tplPuts} (originKey) VALUES (?)`).run(Number(Bun.hash(key))).changes === 1 ? key : null);
+Hooks.register('plugin.cup.put', key => key && db.query(`INSERT OR IGNORE INTO ${tblPuts} (originKey) VALUES (?)`).run(Number(Bun.hash(key) & 0x7ffffffn)).changes === 1);
 Hooks.register('plugin.cup.data', key => db.query(`SELECT value FROM p_cupdata WHERE key=?1`).get(key)?.value);
 
 function dbUpdate(file, data, updateUrl) {
@@ -49,7 +59,7 @@ function dbUpdate(file, data, updateUrl) {
 const invalidated = ContentCategories.map(() => new Map());
 let listInvalidated = false;
 
-Hooks.register('core.alteration', ({categoryIndex, contentKey, invalidateList}) => {
+Hooks.register('core.alteration', ({ categoryIndex, contentKey, invalidateList }) => {
   // console.log(`Altered: ${categoryIndex}/${contentKey}${invalidateList ? ' (with list)' : ''}`);
   if (typeof contentKey !== 'number') throw new Error('Invalid alteration');
   invalidated[categoryIndex].set(contentKey, true);
@@ -57,7 +67,7 @@ Hooks.register('core.alteration', ({categoryIndex, contentKey, invalidateList}) 
 });
 
 function rebuildList(existing) {
-  const ret = {car: {}, track: {}};
+  const ret = { car: {}, track: {} };
   for (const e of db.query(`SELECT c.contentID AS contentID, c.categoryIndex AS categoryIndex, c.dataVersion AS dataVersion, c.flagLimited AS flagLimited, GROUP_CONCAT(a.contentID, "/") AS alternativeIds FROM ${DBTbl.Content} c LEFT JOIN ${DBTbl.AlternativeIDs} a ON a.contentKey=c.contentKey WHERE c.flagsDisabled=0 AND dataVersion IS NOT NULL GROUP BY c.contentKey ORDER BY c.contentID`).all()) {
     const c = ContentCategories[e.categoryIndex].cupID;
     const dst = ret[c] || (ret[c] = {});
@@ -78,7 +88,8 @@ function sync(first) {
   let count = first || listInvalidated ? 1 : 0;
   rebuildStats.start();
 
-  db.transaction(() => {
+  {
+    using _ = db.write().start();
     if (first || listInvalidated) {
       listInvalidated = false;
       const existing = new Map();
@@ -91,9 +102,9 @@ function sync(first) {
       }
 
       Hooks.trigger('plugin.cup.update.gc', existing);
-    } 
+    }
 
-    const defaultAuthorName = new LazyMap(userKey => JSON.parse(db.query(`SELECT userData FROM ${DBTbl.Users} WHERE userKey=?1`).get(userKey).userData).dataAuthor);  
+    const defaultAuthorName = new LazyMap(userKey => JSON.parse(db.query(`SELECT userData FROM ${DBTbl.Users} WHERE userKey=?1`).get(userKey).userData).dataAuthor);
     for (let categoryIndex = 0; categoryIndex < ContentCategories.length; ++categoryIndex) {
       for (const contentKey of first ? db.query(`SELECT contentKey FROM ${DBTbl.Content} WHERE categoryIndex=?1`).all(categoryIndex).map(x => x.contentKey) : invalidated[categoryIndex].keys()) {
         ++count;
@@ -127,8 +138,8 @@ function sync(first) {
       }
       invalidated[categoryIndex].clear();
     }
-  })();
-   
+  }
+
   if (count) {
     rebuildStats.consider(`${count} entries`);
   }
@@ -136,7 +147,14 @@ function sync(first) {
 
 Hooks.register('core.started.async', () => {
   setTimeout(() => sync(true));
-  setInterval(() => sync(false), Settings.dataRefresh * 1e3);
-  setInterval(() => db.query(`DELETE FROM ${tplPuts} WHERE createdDate < ?1`).run(+new Date() / 1e3 - Settings.reportCooldown), Settings.reportCooldown * 250);
+  setInterval(() => sync(false), Timer.ms(Settings.dataRefresh));
+  setInterval(() => db.query(`DELETE FROM ${tblPuts} WHERE createdDate < ?1`).run(+db.value.now - Timer.seconds(Settings.reportCooldown)), Timer.ms(Settings.reportCooldown) * 0.2);
 }, 1e9);
+
+Hooks.register('plugin.cup.reset', () => {
+  using _ = db.write().start();
+  db.query(`DELETE FROM ${tblPuts}`).run();
+  db.query(`DELETE FROM ${tblCupData}`).run();
+  setTimeout(() => sync(true));
+});
 

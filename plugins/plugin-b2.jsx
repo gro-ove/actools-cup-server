@@ -1,5 +1,5 @@
 import { Co, Utils, Access, DBTbl, db, Hooks, Server, pluginSettings, RequestError, Ctx, AppSettings } from "../src/app";
-import { fsExt, HistoryTracker, PerfCounter, Sqid, Timer } from "../src/std";
+import { fsExt, HistoryTracker, jsExt, PerfCounter, Sqid, Timer } from "../src/std";
 
 const fs = require('fs');
 const crypto = require('crypto');
@@ -23,16 +23,16 @@ const Settings = pluginSettings('b2', {
     totalUpload: 5,
     userUpload: 2,
   },
-  lostAgeHrs: 12,
+  lostAge: '12h',
   chunkSizeUpload: 10 * 1024 * 1024,
   uploadDir: '/tmp',
 
-  /** @type {(fileBaseName: string, uploadKey: string) => string} */
+  /** @type {({fileName: string, fileBaseName: string, uploadKey: string}) => string} */
   buildDownloadURL: null // Files are uploaded with names in format `${Settings.bucketPrefix}/${fileBaseName}.${uploadKey}`
 }, s => ({
   caps: s.caps,
   parallelLimits: s.parallelLimits,
-  lostAgeHrs: s.lostAgeHrs,
+  lostAge: s.lostAge,
   chunkSizeUpload: s.chunkSizeUpload,
 }));
 if (!Settings.api.applicationKeyId || !Settings.buildDownloadURL) throw new Error(`Plugin is not configured`);
@@ -40,13 +40,7 @@ if (!Settings.api.applicationKeyId || !Settings.buildDownloadURL) throw new Erro
 const toGB = size => size / (1024 * 1024 * 1024);
 const fromGB = size => size * (1024 * 1024 * 1024);
 
-const perfGCLost = new PerfCounter();
-const perfGCEmergency = new PerfCounter();
-const perfGCTemporary = new PerfCounter();
-const perfGCReferenceless = new PerfCounter();
-const perfGCLargeFiles = new PerfCounter();
-const perfGCRemoteB2 = new PerfCounter();
-const perfGCRemoteB2LargeFiles = new PerfCounter();
+const perfForceCleanUp = new PerfCounter();
 
 class TransferCounter {
   constructor() {
@@ -156,7 +150,8 @@ fsExt.mkdirPSync(Settings.uploadDir);
 const tblFiles = Object.assign(db.table('p_b2_files', {
   fileKey: db.row.integer({ primary: true }),
   fileSHA1: db.row.text({ unique: true }),
-  backblazeData: db.row.text({ nullable: true }),
+  backblazeFileID: db.row.text({ unique: true, nullable: true }),
+  backblazeDownloadData: db.row.text({ nullable: true }),
   createdDate: db.row.integer({ default: db.value.now, index: true }),
   fileSize: db.row.integer(),
   fileName: db.row.text(),
@@ -164,8 +159,8 @@ const tblFiles = Object.assign(db.table('p_b2_files', {
   /** @returns {true|false|null} */
   state(fileKey) {
     if (!fileKey) return null;
-    const e = db.query(`SELECT backblazeData FROM ${this} WHERE fileKey=?1`).get(fileKey);
-    return e ? e.backblazeData != null : null;
+    const e = db.query(`SELECT backblazeFileID FROM ${this} WHERE fileKey=?1`).get(fileKey);
+    return e ? e.backblazeFileID != null : null;
   },
 });
 
@@ -194,7 +189,7 @@ const tblFileLinks = Object.assign(db.table('p_b2_fileLinks', {
   ref(fileKey, userKey, referenceKey = null) {
     if (!fileKey) return;
     db.query(`INSERT INTO ${this} (fileKey, userKey, referenceKey) VALUES (?1, ?2, ?3)
-      ON CONFLICT(fileKey, userKey, referenceKey) DO UPDATE SET referencedDate=?4`).run(fileKey, userKey, referenceKey || 'temporary', Math.floor(Date.now() / 1e3));
+      ON CONFLICT(fileKey, userKey, referenceKey) DO UPDATE SET referencedDate=?4`).run(fileKey, userKey, referenceKey || 'temporary', +db.value.now);
     if (referenceKey) {
       console.log(`New non-empty reference ${referenceKey} has been added, triggering upload…`);
       db.query(`DELETE FROM ${this} WHERE fileKey=?1 AND referenceKey='temporary'`).run(fileKey);
@@ -213,52 +208,18 @@ const tblFileLinks = Object.assign(db.table('p_b2_fileLinks', {
   /** @return {{totalUploadSizeB: integer, totalB2SizeB: integer, totalUploadCount: integer, totalB2Count: integer, userUploadSizeB: integer, userB2SizeB: integer, userUploadCount: integer, userB2Count: integer}} */
   size(userKey) {
     return db.query(`SELECT 
-      SUM(IIF(f.backblazeData IS NULL, f.fileSize, 0)) as totalUploadSizeB,
-      SUM(IIF(f.backblazeData IS NOT NULL, f.fileSize, 0)) as totalB2SizeB,
-      SUM(IIF(f.backblazeData IS NULL, 1, 0)) as totalUploadCount,
-      SUM(IIF(f.backblazeData IS NOT NULL, 1, 0)) as totalB2Count,
-      SUM(IIF(f.backblazeData IS NULL AND l.userKey=?1, f.fileSize, 0)) as userUploadSizeB,
-      SUM(IIF(f.backblazeData IS NOT NULL AND l.userKey=?1, f.fileSize, 0)) as userB2SizeB,
-      SUM(IIF(f.backblazeData IS NULL AND l.userKey=?1, 1, 0)) as userUploadCount,
-      SUM(IIF(f.backblazeData IS NOT NULL AND l.userKey=?1, 1, 0)) as userB2Count
+      SUM(IIF(f.backblazeFileID IS NULL, f.fileSize, 0)) as totalUploadSizeB,
+      SUM(IIF(f.backblazeFileID IS NOT NULL, f.fileSize, 0)) as totalB2SizeB,
+      SUM(IIF(f.backblazeFileID IS NULL, 1, 0)) as totalUploadCount,
+      SUM(IIF(f.backblazeFileID IS NOT NULL, 1, 0)) as totalB2Count,
+      SUM(IIF(f.backblazeFileID IS NULL AND l.userKey=?1, f.fileSize, 0)) as userUploadSizeB,
+      SUM(IIF(f.backblazeFileID IS NOT NULL AND l.userKey=?1, f.fileSize, 0)) as userB2SizeB,
+      SUM(IIF(f.backblazeFileID IS NULL AND l.userKey=?1, 1, 0)) as userUploadCount,
+      SUM(IIF(f.backblazeFileID IS NOT NULL AND l.userKey=?1, 1, 0)) as userB2Count
     FROM ${tblFiles} f
     LEFT JOIN ( SELECT DISTINCT fileKey, userKey FROM ${this} ) l ON f.fileKey = l.fileKey`).get(userKey);
   },
 });
-
-if (0) setTimeout(async () => {
-  const i0 = tblFiles.insert({ fileSHA1: '1', backblazeData: 'null', createdDate: 123, fileSize: 100, fileName: '100 bytes' });
-  const i1 = tblFiles.insert({ fileSHA1: '2', backblazeData: 'null', createdDate: 123, fileSize: 200, fileName: '200 bytes' });
-  const i2 = tblFiles.insert({ fileSHA1: '3', backblazeData: 'null', createdDate: 123, fileSize: 30, fileName: '30 bytes' });
-  const i3 = tblFiles.insert({ fileSHA1: '4', backblazeData: 'null', createdDate: 103, fileSize: 103, fileName: '30 bytes' });
-  const i4 = tblFiles.insert({ fileSHA1: '5', backblazeData: 'null', createdDate: 103, fileSize: 103, fileName: '30 bytes' });
-  tblFileLinks.insert({ fileKey: i0, userKey: 1, referenceKey: 'k', referencedDate: 1 });
-  tblFileLinks.insert({ fileKey: i1, userKey: 2, referenceKey: 'k', referencedDate: 2 });
-  // tblFileLinks.insert({fileKey: i0, userKey: 3, referenceKey: 'u3k', referencedDate: 3});
-  tblFileLinks.insert({ fileKey: i1, userKey: 3, referenceKey: 'u3k', referencedDate: 3 });
-  tblFileLinks.insert({ fileKey: i2, userKey: 3, referenceKey: 'u3k', referencedDate: 3 });
-  tblFileLinks.insert({ fileKey: i2, userKey: 3, referenceKey: 'temporary', referencedDate: 15 });
-  tblFileLinks.insert({ fileKey: i3, userKey: 3, referenceKey: 'temporary', referencedDate: 3 });
-  tblFileLinks.insert({ fileKey: i4, userKey: 3, referenceKey: 'temporary', referencedDate: 3 });
-
-  console.log(db.query(`SELECT 
-    userKey,
-    SUM(fileSize) AS totalFileSize
-FROM (
-    SELECT 
-        l.userKey,
-        f.fileSize
-    FROM ${tblFileLinks} l
-    JOIN ${tblFiles} f ON l.fileKey = f.fileKey
-    WHERE l.referenceKey IS NOT 'temporary'
-    GROUP BY l.userKey, l.fileKey
-) AS uniqueFiles
-GROUP BY userKey`).all(10));
-
-  // const stat = await fetch('https://drive.google.com/uc?export=download&id=0B8YhXYiEI4WXOWhhajNNb1NsdXc');
-  const stat = await fetch('https://cdn.discordapp.com/attachments/1071062868667150386/1077071636286689280/lm_chevrolet_corsa_ss.zip');
-  console.log(stat);
-}, 500);
 
 Hooks.register('core.tpl.userMenu', (menu, $) => menu.push(<Co.Link href="/manage/file">{$.can(Access.MODERATE) ? 'Files' : 'Your files'}</Co.Link>), -0.5);
 
@@ -293,10 +254,19 @@ const tblB2CleanUp = Object.assign(db.table('p_b2_cleanup', {
   },
   /** @return {{backblazeID: string, backblazeName: string}} */
   next() {
-    return db.query(`SELECT backblazeID, backblazeName FROM ${this} LIMIT 1`).get();
+    return db.query(`DELETE FROM ${this} WHERE rowid = (SELECT rowid FROM ${this} LIMIT 1) RETURNING *`).get();
   },
-  done(backblazeID) {
-    db.query(`DELETE FROM ${this} WHERE backblazeID=?1`).run(backblazeID);
+});
+
+const tblB2Missing = Object.assign(db.table('p_b2_missing', {
+  fileId: db.row.text({ primary: true })
+}), {
+  add(fileId) {
+    db.query(`INSERT OR IGNORE INTO ${this} (fileId) VALUES (?1)`).run(fileId);
+  },
+  /** @return {{fileId: string}} */
+  next() {
+    return db.query(`DELETE FROM ${this} WHERE rowid = (SELECT rowid FROM ${this} LIMIT 1) RETURNING *`).get();
   },
 });
 
@@ -329,10 +299,8 @@ Hooks.register('data.downloadURL.verify', url => {
 
 Hooks.register('data.downloadURL.straighten', url => {
   const key = B2URL.decode(url);
-  const data = key && db.query(`SELECT backblazeData FROM ${tblFiles} WHERE fileKey=?1`).get(key)?.backblazeData;
-  if (!data) return undefined;
-  const parsed = JSON.parse(data);
-  return Settings.buildDownloadURL(parsed.fileBaseName, parsed.uploadKey);
+  const data = key && db.query(`SELECT backblazeDownloadData FROM ${tblFiles} WHERE fileKey=?1`).get(key)?.backblazeDownloadData;
+  return data ? Settings.buildDownloadURL(JSON.parse(data)) : undefined;
 });
 
 Hooks.register('data.downloadURL.change', args => {
@@ -357,16 +325,19 @@ Hooks.register('data.downloadURL.change', args => {
   }
 });
 
+const k = Utils.uid();
 Hooks.register('core.tpl.content.uploadURL', (body, $) => {
   if (!$.can(Access.BACKBLAZE)) return;
   const uid = Utils.uid();
   $.foot(<>
-    <script src="/res/script-plugin-b2.js" />
-    <link rel="stylesheet" href="/res/style-plugin-b2.css" />
+    <script src={`/res/script-plugin-b2.js?v=${k}`} />
+    <link rel="stylesheet" href={`/res/style-plugin-b2.css?v=${k}`} />
   </>);
   body[0].content = body[0].content.replace(/<input /, `<input data-b2-target=${JSON.stringify(uid)} `);
   body.splice(0, 0, <div style={{ display: "none" }} class="b2-file">
-    <input data-b2-file={{ sizeCapGB: Settings.caps.fileSizeGB, chunkSizeUpload: Settings.chunkSizeUpload, target: uid }} type="file" />
+    <input
+      data-b2-file={{ sizeCapGB: Settings.caps.fileSizeGB, chunkSizeUpload: Settings.chunkSizeUpload, target: uid }}
+      type="file" accept="application/zip" />
   </div>);
 });
 
@@ -404,6 +375,7 @@ const B2Provider = {
       await Utils.tryAsync(async () => {
         tblCalls.register('authorize', 60);
         const auth = await b2.authorize(Settings.api);
+        b2.setContext('bucketId', undefined);
         const ret = await b2.getBucket(Settings.api);
         db.storage.set('plugin.b2', { bucketId: ret.buckets[0].bucketId, auth });
         b2.setContext('bucketId', ret.buckets[0].bucketId);
@@ -441,17 +413,21 @@ const heldLargeUploadIDs = new HoldNotifier();
 
 const B2Queue = {
   uploading: new Map(),
+  errored: new Map(),
   waiting: new Set(),
 
   report() {
     return {
       uploading: { ...this.uploading },
+      errored: { ...this.errored },
       waiting: [...this.waiting]
     };
   },
 
   status(fileKey) {
     if (this.waiting.has(fileKey)) return 'waiting';
+    const err = this.errored.get(fileKey);
+    if (err) return `error (${err.message && err.message.replace(/^[A-Z][a-z]/, _ => _.toLowerCase())})`;
     return this.uploading.get(fileKey)?.status;
   },
 
@@ -459,8 +435,14 @@ const B2Queue = {
     console.log(`Ensure file is uploaded: ${fileKey}`);
     if (this.uploading.has(fileKey) || this.waiting.has(fileKey)) return;
 
+    const prevErr = this.errored.get(fileKey);
+    if (prevErr) {
+      if ((Date.now() - prevErr.erroredDate) < 10 * 60e3) return;
+      this.errored.delete(fileKey);
+    }
+
     const entry = tblFiles.get(fileKey);
-    if (entry == null || entry.backblazeData) return;
+    if (entry == null || entry.backblazeFileID) return;
 
     if (this.uploading.size >= Settings.parallelLimits.b2) {
       console.log(`Too many files uploading at once, postponing ${entry.fileName}`);
@@ -488,7 +470,7 @@ const B2Queue = {
       using b2 = await B2Provider.grab();
       console.log(`  B2 provider for ${entry.fileName} is ready`);
 
-      const uploadKey = B2URL.sid.encode(fileKey);
+      const uploadKey = Utils.uid();
       const fileBaseName = `${DBTbl.Users.userID(userKey)}/${entry.fileName}`;
 
       let backblazeReply;
@@ -537,8 +519,8 @@ const B2Queue = {
               console.log(`  Uploading piece: ${i + 1}/${pieces}, new attempt${postfix}`);
               if (i === 0) uploading.status = `piece ${i + 1}/${pieces}${postfix}`;
               const chunk = await tmpFile.slice(i * pieceSize, (i + 1) * pieceSize).arrayBuffer();
-              partSha1Array.push(computeSHA1(chunk));
-              console.log(`    ${chunk.byteLength} bytes, SHA1: ${partSha1Array[partSha1Array.length - 1]})`);
+              partSha1Array[i] = computeSHA1(chunk);
+              console.log(`    ${chunk.byteLength} bytes (piece: ${pieceSize}), SHA1: ${partSha1Array[i]})`);
 
               console.log(`  Getting upload URL ${i + 1}/${pieces}${postfix}`);
               const url = await b2.instance.getUploadPartUrl({ fileId });
@@ -551,7 +533,7 @@ const B2Queue = {
                 uploadUrl: url.uploadUrl,
                 uploadAuthToken: url.authorizationToken,
                 data: chunk,
-                sha1: partSha1Array[partSha1Array.length - 1]
+                sha1: partSha1Array[i]
               });
               track.complete();
             }, 2, 1e3);
@@ -562,23 +544,33 @@ const B2Queue = {
         }, 2, 1e3);
       }
 
-      console.log(`  File ${entry.fileName} has been uploaded (file ID: ${backblazeReply.fileId})`);
+      // There is some fuckery going on, so for now let’s just verify uploaded file size as an extra step:
+      const uploadedFileInfo = await b2.instance.getFileInfo(backblazeReply);
+      if (uploadedFileInfo.contentLength !== entry.fileSize) {
+        throw new Error(`Uploaded file size mismatch, expected ${entry.fileSize} bytes, uploaded ${uploadedFileInfo.contentLength} bytes`);
+      }
+
+      console.log(`  File ${entry.fileName} has been uploaded (file ID: ${backblazeReply.fileId}), size checked`);
 
       uploading.status = 'ready';
-      db.transaction(() => {
-        db.query(`UPDATE ${tblFiles} SET backblazeData=?2 WHERE fileKey=?1`).run(fileKey, JSON.stringify({
-          fileBaseName, uploadKey, backblazeID: backblazeReply.fileId, backblazeName: backblazeReply.fileName
+      {
+        using _ = db.write().start();
+        db.query(`UPDATE ${tblFiles} SET backblazeFileID=?2, backblazeDownloadData=?3 WHERE fileKey=?1`).run(fileKey, backblazeReply.fileId, JSON.stringify({
+          fileBaseName, uploadKey, fileName: backblazeReply.fileName
         }));
         tblFileLinks.unref(fileKey)
         updateContentState(fileKey, false, null);
-      })();
+      }
 
       tryDelete(`${Settings.uploadDir}/${entry.fileSHA1}`);
     } catch (err) {
       console.log(`Failed to upload a file ${entry.fileName}: ${err.stack}`);
-      db.transaction(() => {
-        updateContentState(fileKey, false, '' + (err.message || err));
-      })();
+      const message = this.extractErrorMessage(err);
+      this.errored.set(entry.fileKey, { message, erroredDate: Date.now() });
+      {
+        using _ = db.write().start();
+        updateContentState(fileKey, false, message);
+      }
     }
 
     this.uploading.delete(fileKey);
@@ -586,20 +578,24 @@ const B2Queue = {
       this.waiting.delete(waitingFileKey);
       return this.ensureFileIsUploaded(waitingFileKey);
     }
+  },
+
+  extractErrorMessage(err) {
+    if (!err) return 'Unknown error';
+    if (err.fetchResponse) return err.fetchResponse.message || err.fetchResponse.code || err.fetchResponse;
+    return '' + (err.message || err);
   }
 };
 
 function tryDelete(...filename) {
   return Promise.all(filename.map(x => {
-    if (x.endsWith('*')) {
+    if (x.indexOf('*') !== -1) {
       return (async () => await tryDelete(...await Array.fromAsync(new Bun.Glob(x).scan())))();
     }
-    return new Promise((resolve, reject) => {
-      fs.unlink(x, err => {
-        if (err && (!err.code || err.code !== 'ENOENT')) console.warn(`Failed to remove unnecessary file ${x}: ${err}`);
-        resolve();
-      });
-    })
+    return new Promise(resolve => fs.unlink(x, err => {
+      if (err && (!err.code || err.code !== 'ENOENT')) console.warn(`Failed to remove unnecessary file ${x}: ${err}`);
+      resolve();
+    }));
   }));
 }
 
@@ -640,20 +636,53 @@ if (AppSettings.core.dbFileName === ':memory:') {
 // await Bun.sleep(1e9);
 
 const B2GC = {
+  routinePerf: {},
+  queue: null,
+
+  routine(name, callback, period) {
+    period = Timer.parse(period);
+    const perf = name && new PerfCounter();
+    if (name) this.routinePerf[`GC/${name}`] = perf;
+    const step = async force => {
+      if (!this.queue || force === true) {
+        this.queue = this.queue || [];
+      } else {
+        // console.log(`Postponing B2 GC step: ${name}`);
+        if (this.queue.indexOf(step) === -1) this.queue.push(step);
+        return;
+      }
+      // console.log(`Starting B2 GC step: ${name}`);
+      await Bun.sleep(1e3);
+      let ctx, timeout = period;
+      if (name) perf.start();
+      try {
+        ctx = await callback();
+      } catch (e) {
+        console.warn(`B2 GC routine ${name} error: ${e.stack || e}`);
+        timeout += 15e3;
+      }
+      if (name) perf.consider(ctx);
+      // console.log(`B2 GC step is complete: ${name}`);
+      if (this.queue[0]) this.queue.shift()(true);
+      else this.queue = null;
+      setTimeout(step, timeout);
+    };
+
+    setTimeout(step, 1e3);
+  },
+
   async purge(file, tag) {
     if (Array.isArray(file)) return Promise.all(file.map(x => this.purge(x, tag)));
     if (file && typeof file === 'object' && file.fileSHA1) return this.purge(file.fileSHA1, tag);
     try {
-      const fileInfo = db.query(`SELECT fileKey, backblazeData FROM ${tblFiles} WHERE fileSHA1=?1`).get(file);
+      const fileInfo = db.query(`SELECT fileKey, backblazeFileID, backblazeDownloadData FROM ${tblFiles} WHERE fileSHA1=?1`).get(file);
       if (fileInfo) {
-        db.transaction(() => {
-          db.query(`DELETE FROM ${tblFiles} WHERE fileKey=?1`).run(fileInfo.fileKey);
-          db.query(`DELETE FROM ${tblFileLinks} WHERE fileKey=?1`).run(fileInfo.fileKey);
-          if (fileInfo.backblazeData) {
-            const data = JSON.stringify(fileInfo.backblazeData);
-            tblB2CleanUp.add(data.backblazeID, data.backblazeName);
-          }
-        })();
+        using _ = db.write().start();
+        db.query(`DELETE FROM ${tblFiles} WHERE fileKey=?1`).run(fileInfo.fileKey);
+        db.query(`DELETE FROM ${tblFileLinks} WHERE fileKey=?1`).run(fileInfo.fileKey);
+        if (fileInfo.backblazeFileID) {
+          tblB2CleanUp.add(fileInfo.backblazeFileID, JSON.parse(fileInfo.backblazeDownloadData).backblazeName);
+        }
       }
       await tryDelete(`${Settings.uploadDir}/${file}*`);
       console.log(`File ${file} (${tag}) deleted`);
@@ -664,13 +693,13 @@ const B2GC = {
 
   // Not enough space to store a temporary upload, let’s see if we can nuke some other temporary files
   async forceUserCleanUp(userKey, fileSHA1, requiredSpaceB, requiredCount) {
-    perfGCEmergency.start();
+    perfForceCleanUp.start();
     try {
       // Select all file entries that are not referenced by non-temporary links or other users, not uploaded to B2 and do not match uploaded file, ordered from oldest referenced to newest
       const temporaryUserFiles = db.query(`SELECT l.fileKey, f.fileSize, f.fileSHA1
         FROM ${tblFileLinks} l
         JOIN ${tblFiles} f ON l.fileKey = f.fileKey
-        WHERE l.userKey = ?1 AND f.backblazeData IS NULL AND f.fileSHA1 != ?2
+        WHERE l.userKey = ?1 AND f.backblazeFileID IS NULL AND f.fileSHA1 != ?2
         AND l.fileKey NOT IN (
           SELECT fileKey
           FROM ${tblFileLinks}
@@ -689,170 +718,159 @@ const B2GC = {
       }
       return false;
     } finally {
-      perfGCEmergency.consider(`Needed ${Math.max(0, requiredSpaceB)} bytes and ${Math.max(0, requiredCount)} slots`);
+      perfForceCleanUp.consider(`Needed ${Math.max(0, requiredSpaceB)} bytes and ${Math.max(0, requiredCount)} slots`);
     }
-  },
-
-  // Main GC step 
-  async stepMain() {
-    // Removing temporary links older than configured number of hours
-    perfGCTemporary.start();
-    const refsRemoved = db.query(`DELETE FROM ${tblFileLinks} WHERE referenceKey IS 'temporary' AND referencedDate < ?1`)
-      .run(+db.value.now - Settings.lostAgeHrs * 60 * 60).changes;
-    perfGCTemporary.consider(`${refsRemoved} rows`);
-
-    // Removing files without references
-    perfGCReferenceless.start();
-    const toCollect = db.query(`SELECT fileSHA1 FROM ${tblFiles}
-      WHERE fileKey NOT IN ( SELECT DISTINCT fileKey FROM ${tblFileLinks} )`).all();
-    await this.purge(toCollect);
-    perfGCReferenceless.consider(`${toCollect.length} files`);
-
-    // Removing large files that weren’t touched for awhile
-    perfGCLargeFiles.start();
-    const largeFilesRemoved = db.query(`DELETE FROM ${tblLargeFiles} WHERE referencedDate < ?1`)
-      .run(+db.value.now - Settings.lostAgeHrs * 60 * 60).changes;
-    perfGCLargeFiles.consider(`${largeFilesRemoved} rows`);
-
-    setTimeout(() => this.stepMain(), 30 * 60e3);
-  },
-
-  // Just in case there are some random files in B2 temporary dir that are not in the database
-  async stepLost() {
-    perfGCLost.start();
-    let count = 0;
-    try {
-      for (const file of await fs.promises.readdir(Settings.uploadDir)) {
-        ++count;
-        const sha1 = /^[a-f0-9]{40}\b/.test(file) ? RegExp['$&'] : null;
-        if (!sha1) {
-          console.warn(`Unexpected item in the bagging area: ${file}`);
-          continue;
-        }
-        const ageMs = new Date() - (await fs.promises.stat(`${Settings.uploadDir}/${file}`)).mtime;
-        if (ageMs > 3.6e6
-          && db.query(`SELECT COUNT(*) AS count FROM ${tblFiles} WHERE fileSHA1=?1`).get(file).count === 0
-          && !tblLargeFiles.has(sha1)
-          && !heldUploadChecksums.held(sha1)) {
-          this.purge(file, 'lost');
-        }
-        await Bun.sleep(1e3);
-      }
-    } catch (e) {
-      console.warn(`Error when cleaning lost files: ${e.stack || e}`);
-    }
-    perfGCLost.consider(`${count} files tested`);
-    setTimeout(() => this.stepLost(), 5 * 60 * 60e3);
-  },
-
-  // Iterate over files in the B2 bucket, collect file IDs of files not referenced in our DBs
-  async stepRemoteB2() {
-    if (!heldLargeUploadIDs.held('')) {
-      perfGCRemoteB2LargeFiles.start();
-      try {
-        using b2 = await B2Provider.grab(true);
-        const data = await b2.instance.listUnfinishedLargeFiles({ namePrefix: Settings.bucketPrefix });
-        for (const entry of data.files) {
-          if (!heldLargeUploadIDs.held(entry.fileId)) {
-            console.log(`Unfinished B2 file: ${entry.fileName}`);
-            await b2.instance.cancelLargeFile(entry);
-            await Bun.sleep(1e3);
-          }
-        }
-        perfGCRemoteB2LargeFiles.consider();
-      } catch (e) {
-        console.warn(e);
-      }
-    }
-
-    perfGCRemoteB2.start();
-    try {
-      const filesPerStep = 100;
-      let stepsLeft = Settings.caps.totalB2Count / filesPerStep + 10;
-      let seenSHAs = new Set();
-      let repeats = 0;
-      async function step(startFileName) {
-        if (--stepsLeft < 0) throw new Error('Sanity exit');
-
-        const data = await (async () => {
-          using b2 = await B2Provider.grab(true);
-          return await b2.instance.listFileNames({ prefix: Settings.bucketPrefix, maxFileCount: filesPerStep, startFileName });
-        })();
-
-        if (Array.isArray(data.files)) {
-          for (const entry of data.files) {
-            if (!seenSHAs.has(entry.contentSha1)) {
-              seenSHAs.add(entry.contentSha1);
-              if (db.query(`SELECT COUNT(*) AS count FROM ${tblFiles} WHERE fileSHA1=?1`).get(entry.contentSha1).count === 0) {
-                console.log(`B2 file not present in DB: ${entry.fileName}`);
-                tblB2CleanUp.add(entry.fileId, entry.fileName);
-              } else {
-                console.log(`B2 file present in DB: ${entry.fileName}`);
-              }
-            } else if (++repeats) {
-              throw new Error(`Too many repeats: ${entry.contentSha1}`);
-            }
-          }
-        }
-        if (data.nextFileName) {
-          await Bun.sleep(5e3);
-
-          // Using async/await should prevent stack overflow
-          await step(data.nextFileName);
-        }
-      }
-      await step();
-      perfGCRemoteB2.consider(`${seenSHAs.size} files checked`);
-    } catch (e) {
-      console.warn(e);
-    }
-    setTimeout(() => this.stepRemoteB2(), 3 * 60 * 60e3);
-  },
-
-  async stepB2FilePop() {
-    const entry = tblB2CleanUp.next();
-    if (entry) {
-      using b2 = await B2Provider.grab(true);
-      try {
-        await b2.instance.deleteFileVersion({ fileId: entry.backblazeID, fileName: entry.backblazeName });
-        tblB2CleanUp.done(entry.backblazeID);
-        console.log(`Removed ${entry.backblazeName} (${entry.backblazeID}) from B2 storage`);
-      } catch (e) {
-        console.warn(`Failed to delete file ${entry.backblazeName} (${entry.backblazeID}) from B2 storage: ${e}`);
-      }
-    }
-    setTimeout(() => this.stepB2FilePop(), entry ? 1e3 : 60e3);
   },
 };
 
-setTimeout(() => B2GC.stepLost(), 5e3);
-setTimeout(() => B2GC.stepMain(), 5 * 60e3);
-B2Provider.grab().then(async r => {
-  r[Symbol.dispose]();
-  setTimeout(() => B2GC.stepRemoteB2(), 1e3);
-  setTimeout(() => B2GC.stepB2FilePop(), 15e3);
-});
+B2GC.routine('Temporary file-content links', () => {
+  return `${db.query(`DELETE FROM ${tblFileLinks} WHERE referenceKey IS 'temporary' AND referencedDate < ?1`)
+    .run(+db.value.now - Timer.seconds(Settings.lostAge)).changes} rows`;
+}, '30 m');
+B2GC.routine('Files without references', async () => {
+  const toCollect = db.query(`SELECT fileSHA1 FROM ${tblFiles}
+    WHERE fileKey NOT IN ( SELECT DISTINCT fileKey FROM ${tblFileLinks} )`).all();
+  await B2GC.purge(toCollect);
+  return `${toCollect.length} files`;
+}, '30 m');
+B2GC.routine('Forgotten large uploads', async () => {
+  const toCollect = db.query(`DELETE FROM ${tblLargeFiles} WHERE referencedDate < ?1 RETURNING fileChecksum`)
+    .all(+db.value.now - Timer.seconds(Settings.lostAge));
+  for (const item of toCollect) {
+    await tryDelete(`${Settings.uploadDir}/${item.fileChecksum}*`);
+  }
+  return `${toCollect.length} rows`;
+}, '60 m');
+B2GC.routine('Lost temporary files', async () => {
+  let count = 0;
+  for (const file of await fs.promises.readdir(Settings.uploadDir)) {
+    ++count;
+    const sha1 = /^[a-f0-9]{40}\b/.test(file) ? RegExp['$&'] : null;
+    if (!sha1) {
+      console.warn(`Unexpected item in the bagging area: ${file}`);
+      continue;
+    }
+    const ageMs = new Date() - (await fs.promises.stat(`${Settings.uploadDir}/${file}`)).mtime;
+    if (ageMs > 3.6e6
+      && db.query(`SELECT COUNT(*) AS count FROM ${tblFiles} WHERE fileSHA1=?1`).get(file).count === 0
+      && !tblLargeFiles.has(sha1)
+      && !heldUploadChecksums.held(sha1)) {
+      B2GC.purge(file, 'lost');
+    }
+    await Bun.sleep(1e3);
+  }
+  return `${count} files tested`;
+}, '6 h');
+B2GC.routine('Lost B2 large file uploads', async () => {
+  if (heldLargeUploadIDs.held('')) return;
+  using b2 = await B2Provider.grab(true);
+  const data = await b2.instance.listUnfinishedLargeFiles({ namePrefix: Settings.bucketPrefix });
+  for (const entry of data.files) {
+    if (!heldLargeUploadIDs.held(entry.fileId)) {
+      console.log(`Unfinished B2 file: ${entry.fileName}`);
+      await b2.instance.cancelLargeFile(entry);
+      await Bun.sleep(1e3);
+    }
+  }
+}, '6 h');
+B2GC.routine('Lost B2 files', async () => {
+  const filesPerStep = 100;
+  const seenFileIDs = new Set();
+  const dbFileIDs = new Set(...db.query(`SELECT backblazeFileID FROM ${tblFiles} WHERE backblazeFileID IS NOT NULL`).all().map(x => x.dbFileIDs));
+  let stepsLeft = Settings.caps.totalB2Count / filesPerStep + 10;
+  let repeats = 0;
+  async function step(startFileName) {
+    if (--stepsLeft < 0) throw new Error('Sanity exit');
+
+    const data = await (async () => {
+      using b2 = await B2Provider.grab(true);
+      return await b2.instance.listFileNames({ prefix: Settings.bucketPrefix, maxFileCount: filesPerStep, startFileName });
+    })();
+
+    if (Array.isArray(data.files)) {
+      for (const entry of data.files) {
+        dbFileIDs.delete(entry.fileId);
+        if (!seenFileIDs.has(entry.fileId)) {
+          seenFileIDs.add(entry.fileId);
+          if (db.query(`SELECT COUNT(*) AS count FROM ${tblFiles} WHERE backblazeFileID=?1`).get(entry.fileId).count === 0) {
+            console.log(`B2 file not present in DB: ${entry.fileName}`);
+            tblB2CleanUp.add(entry.fileId, entry.fileName);
+          } else {
+            console.log(`B2 file present in DB: ${entry.fileName}`);
+          }
+        } else if (++repeats > 4) {
+          throw new Error(`Too many repeats: ${entry.fileId}`);
+        }
+      }
+    }
+    if (data.nextFileName) {
+      await Bun.sleep(5e3);
+
+      // Using async/await should prevent stack overflow
+      await step(data.nextFileName);
+    }
+  }
+  await step();
+
+  if (dbFileIDs.size > 0) {
+    console.log(`Files present in DB, but not on B2 (${dbFileIDs.size}): ${JSON.stringify([...dbFileIDs.values()], null, 2)}`);
+    using _ = db.write().start();
+    dbFileIDs.forEach(v => tblB2Missing.add(v));
+  }
+
+  return `${seenFileIDs.size} files checked`;
+}, '6 h');
+B2GC.routine('Unnecessary B2 files removal queue', async () => {
+  let counter = 0;
+  for (let i = 0, entry; i < 100 && (entry = tblB2CleanUp.next()); ++i) {
+    ++counter;
+    using b2 = await B2Provider.grab(true);
+    try {
+      await b2.instance.deleteFileVersion({ fileId: entry.backblazeID, fileName: entry.backblazeName });
+      console.log(`Removed ${entry.backblazeName} (${entry.backblazeID}) from B2 storage`);
+    } catch (e) {
+      console.warn(`Failed to delete file ${entry.backblazeName} (${entry.backblazeID}) from B2 storage: ${e}`);
+    }
+  }
+  return `${counter} checked`;
+}, '15 min');
+B2GC.routine('Missing B2 files invalidation queue', async () => {
+  let counter = 0;
+  for (let i = 0, entry; i < 100 && (entry = tblB2Missing.next()); ++i) {
+    ++counter;
+    using b2 = await B2Provider.grab(true);
+    try {
+      await b2.instance.getFileInfo(entry);
+      console.log(`Potentially missing ${entry.fileId} is still present in B2 storage`);
+    } catch (e) {
+      if (e && e.fetchStatus === 404) {
+        console.log(`Expecting to exist ${entry.fileId} is actually missing: ${e}`);
+        const nuked = db.query(`UPDATE ${tblFiles} SET backblazeFileID = NULL, backblazeDownloadData = NULL WHERE backblazeFileID=?1`).run(entry.fileId).changes;
+        console.log(`State fixed: ${nuked} file (should be 1, ideally)`);
+      } else {
+        throw e;
+      }
+    }
+  }
+  return `${counter} checked`;
+}, '15 min');
+B2GC.routine('Files stuck in limbo state', async () => {
+  let counter = 0;
+  for (const entry of db.query(`SELECT fileKey, fileSHA1, fileName FROM ${tblFiles} WHERE backblazeFileID IS NULL`).all()) {
+    if (tblFileLinks.real(entry.fileKey) > 0
+      && await fs.promises.exists(`${Settings.uploadDir}/${entry.fileSHA1}`)
+      && await computeFileSHA1(`${Settings.uploadDir}/${entry.fileSHA1}`) === entry.fileSHA1) {
+      console.log(`Fixing file in limbo state: ${entry.fileName}`);
+      B2Queue.ensureFileIsUploaded(entry.fileKey);
+      ++counter;
+    }
+  }
+  return `${counter} fixes`;
+}, '60 min');
+
+B2Provider.grab().then(async r => r[Symbol.dispose]());
 
 if (process.argv.includes('--test')) {
-  Server.get('/manage/tool/upload-b2', $ => {
-    $.writes(Access.BACKBLAZE);
-    return <Co.Page title="B2 Test">
-      <p>Links: <pre>{JSON.stringify(
-        db.query(`SELECT * FROM ${tblFileLinks} WHERE userKey=?1`).all($.user.userKey)
-      )}</pre></p>
-      <p>Stats: <pre>{JSON.stringify(
-        db.query(`SELECT COUNT(*) as count, SUM(f.fileSize) as totalSize FROM ${tblFileLinks} l LEFT JOIN ${tblFiles} f ON f.fileKey=l.fileKey WHERE l.userKey=?1 GROUP BY l.fileKey`).get($.user.userKey)
-      )}</pre></p>
-      <form method="POST">
-        <input type="file" name="input_file" value="FILE" />
-        <button onclick="uploadB2File(this);return false">Upload file</button>
-        <hr />
-        <output value="Select file and start upload…" />
-        <meter max={1} min={0} value={0} />
-      </form>
-    </Co.Page>
-  });
-
   Server.post('/api/plugin-b2/command/test-upload', async $ => {
     const data = await $.req.arrayBuffer();
     require('fs').writeFileSync('D:/test.dds', data);
@@ -887,10 +905,21 @@ class FileCtx {
     currentlyUploadingPerUser.set(this.$.user.userKey, (currentlyUploadingPerUser.get(this.$.user.userKey) || 0) - 1);
     currentlyUploadingChecksums.delete(this.checksum);
     --totalCurrentlyUploading;
+
+    if (this.deleteOnDispose) {
+      const actualState = tblFiles.get(this.fileKey);
+      const links = db.query(`SELECT * FROM ${tblFileLinks} WHERE fileKey=?1`).all(this.fileKey);
+      if (actualState.backblazeFileID == null
+        && links.length === 1
+        && links[0].userKey === this.$.user.userKey
+        && links[0].referenceKey === 'temporary') {
+        B2GC.purge(actualState, 'failed to upload');
+      }
+    }
   }
 
   async init(name, size) {
-    const existingFile = db.query(`SELECT fileName, fileSize, fileKey, backblazeData FROM ${tblFiles} WHERE fileSHA1=?1`).get(this.checksum);
+    const existingFile = db.query(`SELECT fileName, fileSize, fileKey, backblazeFileID FROM ${tblFiles} WHERE fileSHA1=?1`).get(this.checksum);
     if (existingFile) {
       this.fileKey = existingFile.fileKey;
       if (this.size != null && +this.size !== existingFile.fileSize) throw new RequestError(400, 'Unexpected file size value');
@@ -906,13 +935,18 @@ class FileCtx {
       await this.verifyFileSize(this.size);
       this.fileKey = db.query(`INSERT INTO ${tblFiles} (fileSHA1, fileName, fileSize) VALUES (?1, ?2, ?3)`)
         .run(this.checksum, this.name, this.size).lastInsertRowid;
+      this.deleteOnDispose = true;
     }
 
     this.nameMain = `${Settings.uploadDir}/${this.checksum}`;
-    this.needsUploading = (!existingFile || !existingFile.backblazeData) && !await fs.promises.exists(this.nameMain);
+    this.needsUploading = (!existingFile || !existingFile.backblazeFileID) && !await fs.promises.exists(this.nameMain);
 
     console.log(`Posting ${existingFile ? 'existing' : 'new'} file (${this.$.url.pathname}): ${this.name} (${this.checksum}), ${this.size} bytes, needs uploading: ${this.needsUploading}`);
     tblFileLinks.ref(this.fileKey, this.$.user.userKey);
+  }
+
+  complete() {
+    this.deleteOnDispose = false;
   }
 
   async verifyFileSize(size) {
@@ -955,10 +989,10 @@ class FileCtx {
 
   async promoteFileUpload(nameTmp, checksumVerified) {
     if (checksumVerified || await computeFileSHA1(nameTmp) === this.checksum) {
+      this.deleteOnDispose = false;
       await tryDelete(this.nameMain);
       await fs.promises.rename(nameTmp, this.nameMain);
     } else {
-      tryDelete(nameTmp);
       throw new RequestError(400, 'Checksums mismatch');
     }
     console.log(`  Loaded and verified file: ${this.nameMain} (exists: ${fs.existsSync(this.nameMain)})`);
@@ -974,6 +1008,12 @@ class FileCtx {
   }
 }
 
+async function requireZip(filename) {
+  if (new DataView(await Bun.file(filename).slice(0, 4).arrayBuffer()).getUint32(0) !== 0x504b0304) {
+    throw new RequestError(400, 'ZIP archive is required');
+  }
+}
+
 Server.post('/api/plugin-b2/file', async $ => {
   using f$ = new FileCtx($, $.req.headers.get('x-file-checksum'))
   await f$.init($.req.headers.get('x-file-name'), $.req.headers.get('content-length'));
@@ -985,12 +1025,14 @@ Server.post('/api/plugin-b2/file', async $ => {
       await Bun.write(Bun.file(piece.destination), $.req);
       track.complete();
     }
+    await requireZip(piece.destination);
     await f$.promoteFileUpload(piece.destination);
   }
+  f$.complete();
   return { url: B2URL.encode(f$.fileKey) };
 });
 
-Server.del('/api/plugin-b2/large-file', async $ => {
+Server.delete('/api/plugin-b2/large-file', async $ => {
   using f$ = new FileCtx($, $.req.headers.get('x-file-checksum'));
   if (tblLargeFiles.remove(f$.checksum)) {
     const existingFile = db.query(`SELECT * FROM ${tblFiles} WHERE fileSHA1=?1`).get(this.checksum);
@@ -1022,6 +1064,9 @@ Server.post('/api/plugin-b2/large-file', async $ => {
         await Bun.write(Bun.file(piece.destination), $.req);
         track.complete();
       }
+      if (pieceIndex === 0) {
+        await requireZip(piece.destination);
+      }
       const moved = piece.destination.replace(/\.tmp$/, '') + '.chunk';
       await fs.promises.rename(piece.destination, moved);
       console.log(`  Chunk ${pieceIndex + 1}/${args.chunks.length} is moving to ${moved}…`);
@@ -1035,25 +1080,28 @@ Server.post('/api/plugin-b2/large-file', async $ => {
           }
         };
         const finalChecksum = await mergeFiles(true, args.chunks[0], ...args.chunks.slice(1));
-        if (finalChecksum === f$.checksum) {
-          console.log(`  Multi-part finished and verified: ${finalChecksum}`);
-          await f$.promoteFileUpload(args.chunks[0], true);
-        } else {
+        if (finalChecksum !== f$.checksum) {
           console.log(`  Multi-part checksum mismatch: ${finalChecksum}≠${f$.checksum}`);
           throw new RequestError(400, 'Checksums mismatch');
         }
+        console.log(`  Multi-part finished and verified: ${finalChecksum}`);
+        await f$.promoteFileUpload(args.chunks[0], true);
         return { url: B2URL.encode(f$.fileKey) };
       }
     }
   }
 
+  f$.complete();
   return { total: args.chunks.length, next: args.chunks.map((x, i) => !x && i).filter(x => x !== false)[0], chunk: args.chunkSize };
 });
 
 Server.get('/api/plugin-b2/file/:url', $ => {
   const file = tblFiles.get(B2URL.decode($.params.url));
+  if (file) {
+    db.query(`UPDATE ${tblFileLinks} SET referencedDate=${db.value.now.sqlite} WHERE fileKey=?1 AND userKey=?2 AND referenceKey='temporary'`).run(file.fileKey, $.user.userKey);
+  }
   return file && {
-    status: file.backblazeData ? 'ready' : B2Queue.status(file.fileKey) || 'limbo',
+    status: file.backblazeFileID ? 'ready' : B2Queue.status(file.fileKey) || 'limbo',
     size: file.fileSize,
     name: file.fileName,
     created: file.createdDate
@@ -1062,21 +1110,20 @@ Server.get('/api/plugin-b2/file/:url', $ => {
 
 Server.get('/download/b2/:key', $ => {
   const key = B2URL.sid.decode($.params.key);
-  const data = key && db.query(`SELECT backblazeData FROM ${tblFiles} WHERE fileKey=?1`).get(key)?.backblazeData;
-  if (!data) return null;
-  const parsed = JSON.parse(data);
-  return new Response(null, { status: 302, headers: { 'Location': Settings.buildDownloadURL(parsed.fileBaseName, parsed.uploadKey) } });
+  const data = key && db.query(`SELECT backblazeDownloadData FROM ${tblFiles} WHERE fileKey=?1`).get(key)?.backblazeDownloadData;
+  return data ? new Response(null, { status: 302, headers: { 'Location': Settings.buildDownloadURL(JSON.parse(data)) } }) : null;
 });
 
 function fileStatus(x) {
-  if (x.backblazeData) return 'Ready';
+  if (x.backblazeFileID) return 'Ready';
   return `Processing: ${B2Queue.status(x.fileKey) || 'limbo'}`;
 }
 
 Hooks.register('plugin.overview.user.content', (body, { user }, $) => {
   if (!$.can(Access.MODERATE)) return;
   const files = db.query(`SELECT * FROM ${tblFiles} WHERE fileKey IN (SELECT fileKey FROM ${tblFileLinks} WHERE userKey=?1)`).all(user.userKey);
-  const refs = db.query(`SELECT * FROM ${tblFileLinks} WHERE userKey=?1`).all(user.userKey);
+  if (files.length === 0) return;
+  const refs = db.query(`SELECT * FROM ${tblFileLinks} WHERE userKey=?1 ORDER BY referencedDate`).all(user.userKey);
   body.push(<>
     <h3>Files</h3>
     <table>
@@ -1086,27 +1133,87 @@ Hooks.register('plugin.overview.user.content', (body, { user }, $) => {
         <th onclick="reorder(this)">Uploaded</th>
         <th onclick="reorder(this)">Status</th>
         <th onclick="reorder(this)">Referenced by…</th>
+        <th onclick="reorder(this)">Last reference</th>
       </tr>
-      {files.map(x => <tr data-search={x.fileName} data-disabled={!x.backblazeData}>
-        <td>{x.fileName}</td>
-        <td>{(x.fileSize / (1024 * 1024)).toFixed(1)}</td>
-        <td><Co.Date short value={x.createdDate} /></td>
-        <td>{fileStatus(x)}</td>
-        <td><Co.Value placeholder="none">{[[...new Set(refs.map(y => y.fileKey == x.fileKey && getRefURL(y.referenceKey)).filter(Boolean))].sort().map(x => <>{x}</>).join(', ')]}</Co.Value></td>
-      </tr>)}
+      {files.map(x => {
+        const rs = refs.filter(y => y.fileKey == x.fileKey);
+        return <tr data-search={x.fileName} data-disabled={!x.backblazeFileID}>
+          <td><a href={`/manage/file/b2/${B2URL.sid.encode(x.fileKey)}`}>{x.fileName}</a></td>
+          <td>{(x.fileSize / (1024 * 1024)).toFixed(1)}</td>
+          <td><Co.Date short value={x.createdDate} /></td>
+          <td>{fileStatus(x)}</td>
+          <td><Co.Value placeholder="none">{[[...new Set(rs.map(y => getRefURL(y.referenceKey)).filter(Boolean))].sort().map(x => <>{x}</>).join(', ')]}</Co.Value></td>
+          <td><Co.Value placeholder="none"><Co.Date value={rs.length > 0 ? rs[rs.length - 1].referencedDate : null} /></Co.Value></td>
+        </tr>;
+      })}
     </table>
   </>);
 });
 
-Server.post('/manage/command/file-purge-temporary', async $ => {
-  const entry = tblFiles.get($.params.fileKey);
+Server.post('/manage/command/file-purge', async $ => {
+  const entry = tblFiles.get(B2URL.sid.decode($.params.fileID));
   if (!entry) return null;
-  if (entry.backblazeData) throw new RequestError(400, `Can’t purge finalized file`);
+  updateContentState(entry.fileKey, false, 'File has been deleted, please reupload');
+  B2GC.purge(entry);
+  return '/manage/file';
+});
+
+Server.post('/manage/command/file-purge-temporary', async $ => {
+  const entry = tblFiles.get(B2URL.sid.decode($.params.fileID));
+  if (!entry) return null;
+  if (entry.backblazeFileID) throw new RequestError(400, `Can’t purge finalized file`);
   if (B2Queue.status(entry.fileKey)) throw new RequestError(400, `Can’t purge uploading file`);
   const importantLinks = db.query(`SELECT fileKey FROM ${tblFileLinks} WHERE fileKey=?1 AND ( userKey != ?2 OR referenceKey IS NOT 'temporary' )`).get(entry.fileKey, $.user.userKey);
   if (importantLinks) throw new RequestError(400, `Can’t purge non-temporary file`);
   B2GC.purge(entry);
   return '/manage/file';
+});
+
+Hooks.register('core.formatMessage', arg => arg.message = arg.message.replace(/cup:\/\/(b2\/\w+)/, (_, u) => `<a href="/manage/file/${u}">${_}</a>`));
+
+Server.get('/manage/file/b2/:fileID', async $ => {
+  const file = tblFiles.get(B2URL.sid.decode($.params.fileID));
+  if (!file) return null;
+
+  const liveBlocks = $.liveUpdating(B2Queue.status(file.fileKey) ? 1 : 10, <li>{fileStatus(file)}</li>);
+
+  let b2Status;
+  if (file.backblazeFileID && $.can(Access.ADMIN)) {
+    using b2 = await B2Provider.grab();
+    b2Status = await jsExt.tryCallAsync(async () => await b2.instance.getFileInfo({ fileId: file.backblazeFileID }), e => e.message || e);
+    if (b2Status && b2Status.accountId) delete b2Status.accountId;
+    if (b2Status && b2Status.bucketId) delete b2Status.bucketId;
+  }
+
+  const refs = db.query(`SELECT * FROM ${tblFileLinks} WHERE fileKey=?1 ORDER BY referencedDate`).all(file.fileKey);
+  return <Co.Page title={`File ${file.fileName}`}>
+    <ul class="form">
+      {liveBlocks[0]}
+      <li>Size: {(file.fileSize / (1024 * 1024)).toFixed(1)} MB</li>
+      <li>Created: <Co.Date value={file.createdDate} /></li>
+      <li>Checksum: {file.fileSHA1}</li>
+      <li>References: {refs.length}</li>
+      {refs.length > 0 ? <li>Last reference: <Co.Date value={refs[refs.length - 1].referencedDate} /></li> : null}
+      <h3>References:</h3>
+    </ul><ul class="form">
+      {refs.map(x => <li>{getRefURL(x.referenceKey)}, user: <Co.UserURL userKey={x.userKey} />, <Co.Date value={x.referencedDate} /></li>)}
+    </ul><ul class="form">
+      {b2Status ? <>
+        <h3>B2 status:</h3>
+        <pre>{JSON.stringify(b2Status, null, 4)}</pre>
+      </> : null}
+      {$.can(Access.ADMIN) ? <>
+        <h3>DB row:</h3>
+        <pre>{JSON.stringify(file, null, 4)}</pre>
+      </> : null}
+      <hr />
+      <Co.InlineMenu>
+        {file.backblazeDownloadData ? <Co.Link href={`/download/b2/${$.params.fileID}`}>Download</Co.Link> : null}
+        {$.can(Access.MODERATE) ? null : <Co.Link feedback={`About ${B2URL.encode(file.fileKey)}…`}>Report broken file…</Co.Link>}
+        {$.can(Access.MODERATE) ? <Co.Link action={`/manage/command/file-purge`} args={{ fileID: B2URL.sid.encode(file.fileKey) }} query={`Nuke the file ${file.fileName}?`}>Nuke the file entirely…</Co.Link> : null}
+      </Co.InlineMenu>
+    </ul>
+  </Co.Page>;
 });
 
 Server.get('/manage/file', $ => {
@@ -1127,16 +1234,21 @@ Server.get('/manage/file', $ => {
         <th onclick="reorder(this)">Uploaded</th>
         <th onclick="reorder(this)">Status</th>
         <th onclick="reorder(this)">Referenced by…</th>
+        <th onclick="reorder(this)">Last reference</th>
       </tr>
-      {files.map(x => <tr data-search={x.fileName} data-disabled={!x.backblazeData}>
-        <td>{x.fileName}</td>
-        <td>{(x.fileSize / (1024 * 1024)).toFixed(1)}</td>
-        <td><Co.Date short value={x.createdDate} /></td>
-        <td>{fileStatus(x)}</td>
-        <td>{x.backblazeData == null && !importantLinks.some(y => y.fileKey) && !B2Queue.status(x.fileKey)
-          ? <Co.Link action="/manage/command/file-purge-temporary" args={{ fileKey: x.fileKey }} title="This file is only referenced by you and is in a temporary state, click to purge it completely">temporary (purge)</Co.Link>
-          : <Co.Value placeholder="none">{[[...new Set(refs.map(y => y.fileKey == x.fileKey && getRefURL(y.referenceKey)).filter(Boolean))].sort().map(x => <>{x}</>).join(', ')]}</Co.Value>}</td>
-      </tr>)}
+      {files.map(x => {
+        const rs = refs.filter(y => y.fileKey == x.fileKey);
+        return <tr data-search={x.fileName} data-disabled={!x.backblazeFileID}>
+          <td><a href={`/manage/file/b2/${B2URL.sid.encode(x.fileKey)}`}>{x.fileName}</a></td>
+          <td>{(x.fileSize / (1024 * 1024)).toFixed(1)}</td>
+          <td><Co.Date short value={x.createdDate} /></td>
+          <td>{fileStatus(x)}</td>
+          <td>{x.backblazeFileID == null && !importantLinks.some(y => y.fileKey) && !B2Queue.status(x.fileKey)
+            ? <Co.Link action="/manage/command/file-purge-temporary" args={{ fileID: B2URL.sid.encode(x.fileKey) }} title="This file is only referenced by you and is in a temporary state, click to purge it completely">temporary (purge)</Co.Link>
+            : <Co.Value placeholder="none">{[[...new Set(rs.map(y => getRefURL(y.referenceKey)).filter(Boolean))].sort().map(x => <>{x}</>).join(', ')]}</Co.Value>}</td>
+          <td><Co.Value placeholder="none"><Co.Date value={rs.length > 0 ? rs[rs.length - 1].referencedDate : null} /></Co.Value></td>
+        </tr>;
+      })}
     </table>
     <hr />
     <ul class="form">
@@ -1164,7 +1276,7 @@ Hooks.register('plugin.overview.users.table', (o, users) => {
 Hooks.register('plugin.admin.stats', fn => {
   const space = tblFileLinks.size(-1);
   fn({
-    ['B2']: {
+    ['B2']: Object.assign({
       ['Active uploads']: <Co.Value title={[...currentlyUploadingPerUser.entries()].map(([k, v]) => `${k}: ${v}`).join('\n') || 'No uploads'}>{totalCurrentlyUploading}</Co.Value>,
       ['Active B2 uploads']: B2Queue.uploading.size,
       ['Enqueued B2 uploads']: B2Queue.waiting.size,
@@ -1174,25 +1286,7 @@ Hooks.register('plugin.admin.stats', fn => {
       },
       ['Upload (CUP)']: transferUploadCUP.report(),
       ['Upload (B2)']: transferUploadB2.report(),
-      ['GC (lost)']: perfGCLost,
-      ['GC (emergency)']: perfGCEmergency,
-      ['GC (temporary)']: perfGCTemporary,
-      ['GC (referenceless)']: perfGCReferenceless,
-      ['GC (large files)']: perfGCLargeFiles,
-      ['GC (remote)']: perfGCRemoteB2,
-      ['GC (remote large files)']: perfGCRemoteB2LargeFiles,
-    }
+      ['GC/Forced clean up)']: perfForceCleanUp,
+    }, B2GC.routinePerf)
   })
 }, 1e9);
-
-setTimeout(async () => {
-  for (const entry of db.query(`SELECT fileKey, fileSHA1, fileName FROM ${tblFiles} WHERE backblazeData IS NULL`).all()) {
-    console.log(entry.fileName, tblFileLinks.real(entry.fileKey));
-    if (tblFileLinks.real(entry.fileKey) > 0
-      && await fs.promises.exists(`${Settings.uploadDir}/${entry.fileSHA1}`)
-      && await computeFileSHA1(`${Settings.uploadDir}/${entry.fileSHA1}`) === entry.fileSHA1) {
-      console.log(`Fixing file in limbo state: ${entry.fileName}`);
-      B2Queue.ensureFileIsUploaded(entry.fileKey);
-    }
-  }
-}, 1e3);

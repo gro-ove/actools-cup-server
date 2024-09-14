@@ -45,7 +45,11 @@ function unreadCount($) {
 }
 
 Hooks.register('core.tpl.userMenu.header', (header, $) => unreadCount($) && (header.splice(0, Infinity, <>📩 {header[1]}</>)));
-Hooks.register('core.tpl.userMenu', (menu, $) => menu.push(<Co.Link href="/manage/request">Requests ({unreadCount($)})</Co.Link>), -1);
+Hooks.register('core.tpl.userMenu', (menu, $) => menu.push(<Co.Link href="/manage/request">Requests ({unreadCount($)})</Co.Link>), -1);
+Hooks.register('core.tpl.userPage.menu', (menu, { user }, $) => {
+  if (!$.can(Access.MODERATE)) return;
+  menu.splice(1, 0, <Co.Link href={`/manage/request/new?userID=${user.userID}`}>Contact user…</Co.Link>);
+}, -1);
 
 Server.get('/manage/request/new', $ => {
   if ($.can(Access.MODERATE) === !$.params.userID) throw $.requestError('Not available');
@@ -180,9 +184,10 @@ Server.post('/manage/command/request-delete', $ => {
     }
     return `/manage/request/${rID.encode(restoredKey)}`;
   });
-  db.transaction(() => {
+  {      
+    using _ = db.write().start();
     db.query(`DELETE FROM ${tblRequests} WHERE requestKey=?1`).run(rKey);
     db.query(`DELETE FROM ${tblReplies} WHERE requestKey=?1`).run(rKey);
-  })();
+  }
   return `/manage/request`;
 });

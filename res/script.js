@@ -10,15 +10,25 @@ function fixPage(root) {
   root.querySelectorAll('[data-immediate]').forEach(v => v.querySelectorAll('input, select').forEach(x => x.addEventListener('change', () => v.submit())));
 
   // Some forms don’t have to reload the entire page:
-  if (updateLiveImpl) root.querySelectorAll('[data-live-apply]').forEach(v => {
+    console.log(root.querySelectorAll('[data-live-apply]'));
+  root.querySelectorAll('[data-live-apply]').forEach(v => {
     v.addEventListener('submit', async e => {
       e.preventDefault();
       let formData = new URLSearchParams();
       v.querySelectorAll("input").forEach(input => formData.set(input.name, input.value));
       await fetch(v.action, { method: 'POST', body: formData, headers: { 'Content-Type': 'application/x-www-form-urlencoded' } });
-      updateLiveImpl();
+      if (window.updateLiveImpl) updateLiveImpl();
+      if (v.getAttribute('data-live-apply')) new Function(v.getAttribute('data-live-apply')).call(v);
     });
   });
+
+  root.querySelectorAll('[data-password-toggle]').forEach(v => v.insertAdjacentHTML('beforebegin', '<span class="password-toggle" onclick="return togglePasswordType(this)">👀</span>'))
+}
+
+function togglePasswordType(e) {
+  const i = e.closest('li').querySelector('input');
+  i.type = i.type === 'password' ? null : 'password';
+  e.textContent = i.type === 'password' ? '👀' : '👓';
 }
 
 // Immediate on-page filtering:
@@ -61,7 +71,7 @@ function reorder(w) {
     try {
       const r = new RegExp(i || '.?');
       const m = ids.filter(x => !r.test(x));
-      return m.length ? `❌ Failing test: ${m.join(', ')}` : i ? `✔ Tests are passing` : null;
+      return m.length ? `❌ ${m.join(', ')}` : i ? `✔ Tests are passing` : null;
     } catch (e) {
       return `❌ Invalid expression: ${e.message}`;
     }
@@ -80,7 +90,7 @@ function reorder(w) {
       .bind(null, out(v.getAttribute(attr) || v.value))))));
 
 // Mark edited fields as such, warn before leaving:
-if ([].map.call(document.querySelectorAll('form:not([data-immediate]) label[for]'), v => [v, document.querySelector('#' + v.getAttribute('for'))]).filter(x => x[1]).map(x => [x[0], x[1], x[1][x[1].type === 'checkbox' ? 'checked' : 'value']]).map(x => ['onchange', 'onkeyup', 'onpaste'].map(y => x[1][y] = () => x[0].setAttribute('data-changed', x[1][x[1].type === 'checkbox' ? 'checked' : 'value'] != x[2]))).length) {
+if ([].map.call(document.querySelectorAll('form:not([data-immediate]):not([autocomplete]) label[for]'), v => [v, document.querySelector('#' + v.getAttribute('for'))]).filter(x => x[1]).map(x => [x[0], x[1], x[1][x[1].type === 'checkbox' ? 'checked' : 'value']]).map(x => ['onchange', 'onkeyup', 'onpaste'].map(y => x[1][y] = () => x[0].setAttribute('data-changed', x[1][x[1].type === 'checkbox' ? 'checked' : 'value'] != x[2]))).length) {
   let unsaved = true;
   addEventListener('beforeunload', e => { if (unsaved && document.querySelectorAll('[data-changed=true]').length > 0) e.preventDefault(); });
   [].map.call(document.querySelectorAll('input.good'), v => v.onclick = () => { unsaved = false; });
@@ -91,10 +101,6 @@ function resetUndo() {
   document.cookie = `UndoToken=""; Path=/`;
   document.querySelector('.undo').remove();
   return false;
-}
-
-if (/\bUndoToken="([^\/]+)\/([^"]+)"/.test(document.cookie)) {
-  document.write(`<div class=undo><span>${RegExp.$2}</span> <span class=separator>|</span> <form action="/manage/command/undo" method=POST><input type=hidden value=${RegExp.$1} name=id><input type=submit class=link value="Undo"></form> <span class=separator>|</span> <a href="#" class=good onclick="return resetUndo()">Close</a></div>`);
 }
 
 // Dropdown lists:
@@ -119,9 +125,13 @@ if (liveUpdates.length > 0) {
       }
     });
   }
+  let unfocusedSkip = 0;
   function updateLiveCallback() {
     try {
-      if (document.hasFocus()) updateLiveImpl();
+      if (document.hasFocus() || --unfocusedSkip < 0) {
+        unfocusedSkip = 100;
+        updateLiveImpl();
+      }
       setTimeout(updateLiveCallback, period);
     } catch (e) {
       console.warn(e);

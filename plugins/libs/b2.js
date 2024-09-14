@@ -1,33 +1,53 @@
 /**
- * Forked from https://www.npmjs.com/package/backblaze-b2 for better Bun.js adaptation.
+ * Forked from https://www.npmjs.com/package/backblaze-b2 and adapted for Bun.js.
  */
 
 /** @param {{method: string?, url: string, headers: {}, data: ArrayBuffer?, progress: null|(v: number) => void}} params */
 async function request(params) {
   // console.log(`B2 request: ${params.method || 'GET'} ${params.url}, headers: ${JSON.stringify(params.headers)}, data: ${params.data && params.data.byteLength != null ? `${params.data.byteLength} bytes` : JSON.stringify(params.data || null)}`);
-  const req = await fetch(params.url, {
-    method: params.method || 'GET',
-    headers: params.headers,
-    body: params.data instanceof ArrayBuffer || params.data instanceof Buffer || typeof params.data === 'string'
-    // body: params.data instanceof ArrayBuffer ? new Response(params.data) :  params.data instanceof Buffer || typeof params.data === 'string'
-        ? params.data : JSON.stringify(params.data)
-  });
-  // console.log(`  B2 request status: ${req.status}`);
-  if (params.uploadErrorHandling) {
-    if (req.status === 503 || req.status === 429 /* Too Many Requests */) {
-      await Bun.sleep(((req.headers.get('Retry-After') | 0) || 5) * 1e3);
-    }
-    if (req.status === 401 || req.status === 408 || req.status >= 500) {
-      throw new Error('Try again');
-    }
+  let req;
+  try {
+    req = await fetch(params.url, {
+      method: params.method || 'GET',
+      headers: params.headers,
+      body: params.data instanceof ArrayBuffer || params.data instanceof Buffer || typeof params.data === 'string' ? params.data : JSON.stringify(params.data)
+    });
+  } catch (e) {
+    throw Object.assign(e, { repeat: params.uploadErrorHandling ? 1 : true });
   }
-  if (req.status < 200 || req.status >= 400) throw new Error(`B2 error ${req.status} (${await req.text()})`);
+  // console.log(`  B2 request status: ${req.status}`);
+  if (req.status < 200 || req.status >= 400) {
+    let repeat = true;
+    if (params.uploadErrorHandling) {
+      if (req.status === 503 || req.status === 429 /* Too Many Requests */) {
+        await Bun.sleep(((req.headers.get('Retry-After') | 0) || 5) * 1e3);
+      }
+      if (req.status === 401 || req.status === 408 || req.status >= 500) {
+        repeat = 1;
+      }
+    } else if (req.status === 400 || req.status === 401) {
+      repeat = undefined;
+    }
+    let errorMsg = `B2 error ${req.status}`;
+    let fetchResponse;
+    try {
+      const body = await req.text();
+      try {
+        fetchResponse = JSON.parse(body);
+        errorMsg = `${errorMsg} (${JSON.stringify(fetchResponse)})`;
+      } catch {
+        fetchResponse = body;
+        errorMsg = `${errorMsg} (${body})`;
+      }
+    } catch { }
+    throw Object.assign(new Error(errorMsg), { repeat, fetchStatus: req.status, fetchResponse });
+  }
   return await req.json();
 }
 
 const conf = {
   API_AUTHORIZE__URL: 'https://api.backblazeb2.com/b2api/v2/b2_authorize_account',
-  API_VERSION_URL: '/b2api/v2',
+  API_VERSION_URL: '/b2api/v3',
   MAX_INFO_HEADERS: 10
 };
 

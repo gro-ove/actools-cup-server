@@ -1,10 +1,12 @@
-const { Hooks, db, DBTbl, DisabledFlag, Utils, ContentUtils, pluginSettings } = require("../src/app");
+import { Hooks, db, DBTbl, DisabledFlag, ContentUtils, pluginSettings } from '../src/app';
+import { Timer } from '../src/std';
 
 const hiddenReason = 'Update URL seems to not be working';
 const validated = db.map('p_dwnvalid', db.row.text(), db.row.integer());
 
 const Settings = pluginSettings('downloadValidity', {
   checkCooldown: 300,
+  verbose: false
 }, s => ({ checkCooldown: s.checkCooldown }));
 
 async function validateURL(url) {
@@ -12,12 +14,12 @@ async function validateURL(url) {
     const type = ContentUtils.verifyURL(url);
     if (type === 0) return true;
     if (type === 2) url = `http://` + url;
-    console.log(`Validating URL: ${url}`);
+    if (Settings.verbose) console.log(`Validating URL: ${url}`);
     const r = await fetch(url);
-    console.log(`  Resulting code: ${r.status}`);
+    if (Settings.verbose) console.log(`  Resulting code: ${r.status}`);
     return r.status < 400 || r.status > 499;
   } catch (e) {
-    console.warn(`  Validating error: ${e}`)
+    if (Settings.verbose) console.warn(`  Validating error: ${e}`)
     return false;
   }
 }
@@ -38,10 +40,12 @@ function foundBroken(refID, updateUrl) {
 async function runValidation(url, refID) {
   if (queue) {
     queue.push([url, refID]);
+    db.storage.set('validationQueue', queue);
   } else {
     queue = [[url, refID]];
     const runResults = {};
     for (var i = 0; i < queue.length; ++i) {
+      db.storage.set('validationQueue', queue.slice(i));
       const [nextURL, nextRefID] = queue[i];
       let stat = runResults[nextURL];
       if (stat == null) {
@@ -53,11 +57,14 @@ async function runValidation(url, refID) {
         console.log(`Broken URL detected: ${nextURL} (${nextRefID.join('/')})`);
         foundBroken(nextRefID, nextURL);
       }
-      await Bun.sleep(Settings.checkCooldown);
+      await Bun.sleep(Timer.ms(Settings.checkCooldown));
     }
     queue = null;
+    db.storage.set('validationQueue', []);
   }
 }
+
+db.storage.get('validationQueue')?.forEach(([url, refID]) => runValidation(url, refID));
 
 Hooks.register('data.downloadURL.verify', (url, content) => {
   const v = validated.get(url);
