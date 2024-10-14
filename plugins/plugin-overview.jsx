@@ -28,6 +28,7 @@ Hooks.register('core.user.content', user => {
     c.countComplains AS countComplains,
     c.flagsDisabled AS flagsDisabled,
     c.flagSearcheable AS flagSearcheable,
+    c.flagLimited AS flagLimited,
     c.flagOriginal AS flagOriginal,
     GROUP_CONCAT(a.contentID, ", ") AS alternativeIds
   FROM ${DBTbl.Content} c 
@@ -49,10 +50,10 @@ Hooks.register('core.user.content', user => {
         <th onclick="reorder(this)">Complains</th>
       </tr>
       {e.map(x => <><tr data-search={x.alternativeIds ? x.contentID + ', ' + x.alternativeIds : x.contentID} data-disabled={(x.flagsDisabled & DisabledFlag.USER) !== 0} data-errored={(x.flagsDisabled & (DisabledFlag.USER | DisabledFlag.HIDDEN)) === DisabledFlag.HIDDEN}>
-        <td><a href={`/manage/${ContentCategories[x.categoryIndex].id}/${x.contentID}`}>{x.dataName ? `${x.dataName} (${x.contentID})` : x.contentID}</a></td>
+        <td><a href={U`/manage/${ContentCategories[x.categoryIndex].id}/${x.contentID}`}>{x.dataName ? `${x.dataName} (${x.contentID})` : x.contentID}</a></td>
         <td>{ContentCategories[x.categoryIndex].title}</td>
         <td>{stateLabel(x)}</td>
-        <td><Co.Value placeholder="none">{[x.flagSearcheable && 'searcheable', x.flagOriginal && 'original'].filter(Boolean).join(', ')}</Co.Value></td>
+        <td><Co.Value placeholder="none">{[x.flagSearcheable && 'searchable', x.flagOriginal && 'original', x.flagLimited && 'limited'].filter(Boolean).join(', ')}</Co.Value></td>
         <td>{x.dataVersion}</td>
         <td>{x.countDownloads}</td>
         <td>{x.countComplains}</td>
@@ -85,6 +86,7 @@ Server.get('/manage/overview', $ => {
         c.countComplains AS countComplains,
         c.flagsDisabled AS flagsDisabled,
         c.flagSearcheable AS flagSearcheable,
+        c.flagLimited AS flagLimited,
         c.flagOriginal AS flagOriginal,
         u.userID AS userID,
         GROUP_CONCAT(a.contentID, ", ") AS alternativeIds
@@ -92,14 +94,14 @@ Server.get('/manage/overview', $ => {
       LEFT JOIN ${DBTbl.AlternativeIDs} a ON c.contentKey = a.contentKey
       LEFT JOIN ${DBTbl.Users} u ON c.userKey = u.userKey
       GROUP BY c.contentKey ${DBTbl.Content.order('c')}`).all().map(x => <><tr data-search={x.alternativeIds ? x.contentID + ', ' + x.alternativeIds : x.contentID} data-disabled={(x.flagsDisabled & DisabledFlag.USER) !== 0} data-errored={(x.flagsDisabled & (DisabledFlag.USER | DisabledFlag.HIDDEN)) === DisabledFlag.HIDDEN}>
-        <td><a href={`/manage/${ContentCategories[x.categoryIndex].id}/${x.contentID}`}>{x.dataName ? `${x.dataName} (${x.contentID})` : x.contentID}</a></td>
+        <td><a href={U`/manage/${ContentCategories[x.categoryIndex].id}/${x.contentID}`}>{x.dataName ? `${x.dataName} (${x.contentID})` : x.contentID}</a></td>
         <td>{ContentCategories[x.categoryIndex].title}</td>
         <td>{stateLabel(x)}</td>
-        <td><Co.Value placeholder="none">{[x.flagSearcheable && 'searcheable', x.flagOriginal && 'original'].filter(Boolean).join(', ')}</Co.Value></td>
+        <td><Co.Value placeholder="none">{[x.flagSearcheable && 'searchable', x.flagOriginal && 'original', x.flagLimited && 'limited'].filter(Boolean).join(', ')}</Co.Value></td>
         <td>{x.dataVersion}</td>
         <td>{x.countDownloads}</td>
         <td>{x.countComplains}</td>
-        <td><Co.UserURL userID={x.userID} /></td>
+        <td><Co.UserLink userID={x.userID} /></td>
       </tr>{x.alternativeIds ? <tr class="details"><td colspan="5">Also includes: {x.alternativeIds}</td></tr> : null}</>)}
     </table>
     <hr />
@@ -147,7 +149,7 @@ Server.get('/manage/user', $ => {
         </> : null}
       </tr>
       {entries.map((x, i) => <tr data-search={x.userID}>
-        <td><Co.UserURL userID={x.userID} /></td>
+        <td><Co.UserLink userID={x.userID} /></td>
         <td>{x.count}</td>
         <td>{x.count + x.altCount}</td>
         <td>{x.count - x.countActive}</td>
@@ -165,7 +167,7 @@ Server.get('/manage/user', $ => {
     <hr />
     <ul class="form">
       <Co.InlineMenu $hook='plugin.overview.users.menu'>
-        <a href={`/manage/user/${$.user.userID}`}>Own profile…</a>
+        <a href={U`/manage/user/${$.user.userID}`}>Own profile…</a>
       </Co.InlineMenu>
     </ul>
   </Co.Page>;

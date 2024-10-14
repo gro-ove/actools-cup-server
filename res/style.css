@@ -1,4 +1,4 @@
-:root{--bg:#fff;--input-bg:#eee;--accent-warn:#b00;--accent-good:#080;--text-color:#000;--link:#008;--separator:#0008;--table-odd:#7771;--input-bg-opaque:var(--input-bg)}
+:root{--bg:#fff;--input-bg:#eee;--accent-warn:#b00;--accent-good:#080;--text-color:#000;--link:#008;--separator:#0008;--table-odd:#7774;--input-bg-opaque:var(--input-bg)}
 
 #dummy{display:none;}
 input,textarea,html{color:var(--text-color)}
@@ -8,22 +8,22 @@ html{font-family:sans-serif;font-size:0.8em;background:var(--bg);scrollbar-width
 form{display:inline;font:inherit}
 textarea{font-family:inherit}
 form input.link{background:none;border:none;display:inline;padding:0;cursor:pointer;font:inherit}
-table,tr,th,td{font:inherit}
+table,tr,th,td,select{font:inherit}
 h1 input{background:none;border:none;display:inline;padding:0;font:inherit}
 h1 input::placeholder{opacity:0.3}
 /* select[data-forced-choice]:required{ color:red } */
 th{font-weight:700;text-align:left}
 th:not(:first-child){padding-left:20px}
-td:not(:first-child){text-align:right}
+td:not(:first-of-type){text-align:right}
 ul:empty:after{content:"<No entries>";opacity:0.5}
-.row input,.row textarea,.row select{margin:0;padding:0;border:none;box-sizing: border-box;}
-.row input,.row textarea,form:not([data-immediate]) .row select{background:var(--input-bg);width:calc(100% - 160px)}
+.row input,.row textarea,.row select{margin:0;padding:0;border:none;box-sizing: border-box;min-height:16px;}
+.row input:not([type=submit]),.row textarea,form:not([data-immediate]) .row select{background:var(--input-bg);width:calc(100% - 160px)}
 .row button{float:right;width:200px;height:16px;font-size:0.8em}
 .row input,.row textarea{padding:0 4px;vertical-align:top}
 .row input[readonly]{background:none}
 .row input[type=checkbox],.row input[type=radio]{margin-left:4px;width:auto}
 ul.form li{margin-bottom:4px}
-form label{width:160px;display:inline-block}
+form label, .form-rows label{width:160px;display:inline-block}
 form .row textarea{height:80px}
 label.for:after, label[for]:not(.inline2):after{content:": "}
 label.for, label[for]:not(.inline2)[data-changed=true]:after{content:"*: "}
@@ -32,10 +32,13 @@ label.inline2{margin-left:4px;margin-right:8px}
 a[data-selected],form input.link[data-selected],span[data-selected]{font-weight:bold}
 li.details{font-size:1.25em}
 li.details>div{margin:4px 0 8px;font-size:0.8em}
-.undo{position:fixed;left:40px;bottom:40px;background:var(--input-bg);z-index:10;padding:20px}
+.toasts{position:fixed;left:40px;bottom:40px;z-index:10}
+.toast{background:var(--input-bg);padding:20px;margin-bottom:12px;border-left:4px solid var(--text-color)}
+.toast[data-toast=good]{border-left-color:var(--accent-good)}
+.toast[data-toast=warn]{border-left-color:var(--accent-warn)}
 .separator,hr{color:var(--separator);border-color:var(--separator)}
 a{text-decoration:none}
-span[title],a[title],input.link[title],li[title] span{text-decoration:underline dashed}
+span[title],th[title],a[title],input.link[title],li[title] span{text-decoration:underline dashed}
 span[title]:after,a[title]:after,li[title] span:after{content:"?";font-size:0.6em;vertical-align:top}
 label.inline,label.inline2{width:auto}
 
@@ -46,13 +49,16 @@ select option:disabled{background-color:color-mix(in srgb, var(--input-bg-opaque
 select:invalid,::placeholder {color:rgb(from var(--text-color) r g b / 0.4)}
 .placeholder,li[data-disabled],tr[data-disabled] td,tr[data-disabled]+.details td{opacity:0.5}
 li[data-errored],tr[data-errored] td,tr[data-errored]+.details td{color:var(--accent-warn)}
+li[data-ignored],tr[data-ignored] td,tr[data-ignored]+.details td{text-decoration:line-through;}
 .mono{font-family:monospace;padding:2px 8px;margin:-2px 0;background:var(--input-bg);text-decoration:none;display:inline-block}
-li+hr,ul>div+hr{margin-top:10px}
-li,[data-input-result]{position:relative}
-[data-input-result]:after{content:attr(data-input-result);display:block;font-size:0.8em;position:absolute;right:0;top:0;bottom:0;pointer-events:none;text-align:right;text-wrap:nowrap;text-overflow:ellipsis;overflow:hidden;padding:0 8px;color:color-mix(in srgb, var(--bg) 25%, var(--text-color) 75%);max-width:calc(100% - 300px);text-overflow:ellipsis}
+li+hr,ul>live-updating+hr{margin-top:10px}
+li{position:relative}
+.input-result.notclickable{pointer-events:none}
+.input-result{display:block;font-size:0.8em;position:absolute;right:0;top:0;bottom:0;text-align:right;text-wrap:nowrap;text-overflow:ellipsis;overflow:hidden;padding:0 8px;color:color-mix(in srgb, var(--bg) 25%, var(--text-color) 75%);max-width:calc(100% - 300px);text-overflow:ellipsis}
 .password-toggle{position:absolute;right:8px;top:0;bottom:0;z-index:1;color:var(--text-color);font-size:0.8em;line-height:16px;cursor:pointer}
-.link,[data-input-result^="❌"]:after{color:var(--accent-warn)}
-.good,[data-input-result^="✔"]:after{color:var(--accent-good)}
+.link{color:var(--accent-warn)}
+.good{color:var(--accent-good)}
+.disabled,body:not(.any-edited) .disabled-unless-edited:not([data-submit-always-enabled]){color:color-mix(in srgb, var(--bg) 50%, var(--text-color) 50%)}
 .checkboxes nobr input{margin:0; padding:0}
 .checkboxes nobr label{font-size:0.8em;vertical-align:text-top}
 .details{font-size:0.8em}
@@ -65,17 +71,27 @@ noscript{height:80px;background:#a00;color:#fff;width:100%;z-index:9;position:fi
 .page-search{float:right}
 [data-msg-unread]{position:relative}
 [data-msg-unread]:before{position:absolute;content:"";background:var(--separator);left:-30px;width:4px;top:0;bottom:0}
-table{font-size:0.9em;width:100%}
+table{font-size:0.9em;width:100%;}
 [data-filtered=false],[data-filtered=false]+.details{display:none}
 th:not(:first-child){text-align:right}
-td:last-child{padding-left:20px}
-tr:nth-child(2n+1){background:var(--table-odd)}
-th{position:relative;cursor:pointer} 
+td:last-child{padding-left:8px}
+tr:nth-child(2n+1) td{background:color-mix(in srgb, transparent 75%, var(--table-odd) 25%)}
+th{background:var(--table-odd)}
+th[onclick]{position:relative;cursor:pointer} 
 [data-sort="1"]:after{content:'↑';position:absolute;margin-left:4px;margin-top:-1px} 
 [data-sort="0"]:after{content:'↓';position:absolute;margin-left:4px;margin-top:-1px}
 blockquote{white-space:pre-wrap}
 [data-online]:before{content:"•";padding-right:0.3em;display:inline-block;color:var(--accent-good)}
 input:-webkit-autofill,input:-webkit-autofill:focus{-webkit-box-shadow:0 0 0 1px var(--accent-good), 0 0 0 10px var(--bg) inset;-webkit-text-fill-color:var(--text-color);}
+
+.advtable{empty-cells:show}
+.advtable th{text-align:center;}
+.advtable tr td{background:transparent;}
+.advtable tr:nth-of-type(4n+1) td,.advtable tr:nth-of-type(4n+2) td{background:color-mix(in srgb, transparent 50%, var(--table-odd) 50%)}
+.advtable td,.advtable th{padding:4px}
+th.side{position:relative}
+th.side span{display:inline-block;transform-origin: 50% 0;transform: rotate(90deg);position:absolute;white-space:nowrap;}
+body:not([data-search-active]) .search-unhide{display:none}
 
 .dropdown{position:relative}
 .dropdown a{cursor:pointer}
@@ -87,6 +103,9 @@ input:-webkit-autofill,input:-webkit-autofill:focus{-webkit-box-shadow:0 0 0 1px
 .dropdown-content>span>a:after{content:"▶";float:right}
 .dropdown-content[data-dropdown-align-right]>span>a:after{content:"◀";float:left;margin-left:-16px}
 [data-checked]:before{content:"◀";float:left;margin-left:-16px}
+
+.tags{padding:8px 0;display:flex;gap:8px;font-size:0.8em;font-weight:700;}
+.tags span{background:var(--input-bg);padding:4px 8px}
 
 .text-trim{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:block}
 li[data-marker]::marker{content:attr(data-marker)}
@@ -110,6 +129,8 @@ hr{flex-grow:1;width:100%}
 body{margin:12px 20px}
 main .center{max-width:600px;margin:40px auto}
 header{position:sticky;top:0;z-index:1;background:var(--bg);border-bottom:var(--separator) 1px solid;padding:8px 0;height:15px}
+
+.attention{border:2px dashed var(--accent-good);padding:8px;margin:6px 0 20px 160px}
 
 @media (prefers-color-scheme:dark){
   :root{--bg:#111;--input-bg:#222;--text-color:#fff;--accent-warn:#f77;--accent-good:#7f7;--link:#7af;--separator:#fff8}

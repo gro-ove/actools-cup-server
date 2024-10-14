@@ -1,11 +1,11 @@
 import {
   Access, AppSettings, Co, ContentCategories, ContentUtils,
-  db, DBTbl, DisabledFlag, formatGenericPage, Hooks, Locale, RequestError, Server,
+  db, DBTbl, DisabledFlag, DownloadableSource, formatGenericPage, Hooks, Locale, RequestError, Server,
   Utils
 } from './app';
-import { BunJSX, LazyMap } from './std';
+import { BunJSX, LazyMap, prepareAsset } from './std';
 
-Server.redirect('/manage', $ => `/manage/group/${db.query(`SELECT groupID FROM ${DBTbl.Groups} WHERE userKey=?1 ${DBTbl.Groups.order()} LIMIT 1`).get($.user.userKey).groupID}`);
+Server.redirect('/manage', $ => U`/manage/group/${db.query(`SELECT groupID FROM ${DBTbl.Groups} WHERE userKey=?1 ${DBTbl.Groups.order()} LIMIT 1`).get($.user.userKey).groupID}`);
 Server.get('/manage', $ => {
   $.user;
   return '/manage';
@@ -22,22 +22,30 @@ Server.post('/manage/command/undo-close', $ => $.clearUndo());
 
 Server.post('/manage/command/content-move', $ => {
   $.writes();
-  return db.query(`UPDATE ${DBTbl.Content} SET groupKey=?1 WHERE userKey=?2 AND contentID=?3 AND categoryIndex=?4`).run($.group.groupKey, $.user.userKey, $.params.contentID, $.categoryIndex).changes ? `/manage/group/${$.group.groupID}` : null;
+  return db.query(`UPDATE ${DBTbl.Content} SET groupKey=?1 WHERE userKey=?2 AND contentID=?3 AND categoryIndex=?4`).run($.group.groupKey, $.user.userKey, $.params.contentID, $.categoryIndex).changes ? U`/manage/group/${$.group.groupID}` : null;
 });
 
 Server.post('/manage/command/content-toggle', $ => {
   const entry = db.query(`SELECT * FROM ${DBTbl.Content} WHERE categoryIndex=?1 AND contentID=?2`).get($.categoryIndex, $.params.contentID);
   $.writes(entry);
-  db.query(`UPDATE ${DBTbl.Content} SET flagsDisabled=?2 WHERE contentKey=?1`).run(entry.contentKey, Utils.bitFlag(entry.flagsDisabled, DisabledFlag.USER, !+$.params.state));
+  db.query(`UPDATE ${DBTbl.Content} SET flagsDisabled=?2 WHERE contentKey=?1`).run(entry.contentKey, entry.flagsDisabled.setFlag(DisabledFlag.USER, !+$.params.state));
   Hooks.trigger('core.alteration', { categoryIndex: $.categoryIndex, contentKey: entry.contentKey, invalidateList: true });
-  return `/manage/${$.params.categoryID}/${$.params.contentID}`;
+  return U`/manage/${$.params.categoryID}/${$.params.contentID}`;
+});
+
+Server.post('/manage/command/content-searchable-toggle', $ => {
+  const entry = db.query(`SELECT * FROM ${DBTbl.Content} WHERE categoryIndex=?1 AND contentID=?2`).get($.categoryIndex, $.params.contentID);
+  $.writes(entry);
+  db.query(`UPDATE ${DBTbl.Content} SET flagSearcheable=?2 WHERE contentKey=?1`).run(entry.contentKey, $.params.state);
+  Hooks.trigger('core.alteration', { categoryIndex: $.categoryIndex, contentKey: entry.contentKey, invalidateList: true });
+  return U`/manage/${$.params.categoryID}/${$.params.contentID}`;
 });
 
 Server.post('/manage/command/content-reset-complains', $ => {
   const entry = db.query(`SELECT * FROM ${DBTbl.Content} WHERE categoryIndex=?1 AND contentID=?2`).get($.categoryIndex, $.params.contentID);
   $.writes(entry);
   db.query(`UPDATE ${DBTbl.Content} SET countComplains=0 WHERE contentID=?1 AND categoryIndex=?2`).run(entry.contentID, $.categoryIndex);
-  return `/manage/${$.params.categoryID}/${$.params.contentID}`;
+  return U`/manage/${$.params.categoryID}/${$.params.contentID}`;
 });
 
 Server.post('/manage/command/content-block', $ => {
@@ -46,15 +54,15 @@ Server.post('/manage/command/content-block', $ => {
   if (!entry) return null;
   const data = JSON.parse(entry.contentData);
   data.blockedReason = $.params.value || null;
-  db.query(`UPDATE ${DBTbl.Content} SET flagsDisabled=?2, contentData=?3 WHERE contentKey=?1`).run(entry.contentKey, Utils.bitFlag(entry.flagsDisabled, DisabledFlag.BLOCKED, $.params.value), JSON.stringify(data));
+  db.query(`UPDATE ${DBTbl.Content} SET flagsDisabled=?2, contentData=?3 WHERE contentKey=?1`).run(entry.contentKey, entry.flagsDisabled.setFlag(DisabledFlag.BLOCKED, $.params.value), JSON.stringify(data));
   Hooks.trigger('core.alteration', { categoryIndex: $.categoryIndex, contentKey: entry.contentKey, invalidateList: true });
-  return `/manage/${$.params.categoryID}/${$.params.contentID}`;
+  return U`/manage/${$.params.categoryID}/${$.params.contentID}`;
 });
 
 Server.post('/manage/command/group-rename', $ => {
   $.writes();
   const id = Utils.ensureUnique($.id, x => db.query(`SELECT groupKey FROM ${DBTbl.Groups} WHERE userKey=?1 AND groupID=?2 AND groupID!=?3`).get($.user.userKey, x, $.params.groupID));
-  return db.query(`UPDATE ${DBTbl.Groups} SET name=?3, groupID=?4 WHERE userKey=?1 AND groupID=?2`).run($.user.userKey, $.params.groupID, $.params.value, id).changes ? `/manage/group/${$.id}` : null;
+  return db.query(`UPDATE ${DBTbl.Groups} SET name=?3, groupID=?4 WHERE userKey=?1 AND groupID=?2`).run($.user.userKey, $.params.groupID, $.params.value, id).changes ? U`/manage/group/${id}` : null;
 });
 
 Server.post('/manage/command/group-delete', $ => {
@@ -79,9 +87,9 @@ Server.post('/manage/command/group-delete', $ => {
 });
 
 Server.post('/manage/command/user-change-password', $ => {
-  $.writes(Access.MODERATE);
+  $.writes(Access.ADMIN);
   const user = db.query(`SELECT * FROM ${DBTbl.Users} WHERE userID=?1`).get($.params.userID);
-  return db.query(`UPDATE ${DBTbl.Users} SET password=?1 WHERE userKey=?2`).run(DBTbl.Users.passEncode(user.userID, $.params.value), user.userKey).changes ? `/manage/user/${user.userID}` : null;
+  return db.query(`UPDATE ${DBTbl.Users} SET password=?1 WHERE userKey=?2`).run(DBTbl.Users.passEncode(user.userID, $.params.value), user.userKey).changes ? U`/manage/user/${user.userID}` : null;
 });
 
 // Content:
@@ -89,20 +97,148 @@ Server.post('/manage/group', $ => {
   $.writes();
   const id = Utils.ensureUnique($.id, x => db.query(`SELECT groupKey FROM ${DBTbl.Groups} WHERE userKey=?1 AND groupID=?2`).get($.user.userKey, x));
   db.query(`INSERT INTO ${DBTbl.Groups} (userKey, groupID, name) VALUES (?1, ?2, ?3)`).run($.user.userKey, id, $.params.value);
-  return `/manage/group/${id}`;
+  return U`/manage/group/${id}`;
+});
+
+const cmdSetAuthorName = Server.command((categoryIndex, contentID) => {
+  db.query(`UPDATE ${DBTbl.Content} SET dataAuthor=?3 WHERE contentID=?1 AND categoryIndex=?2`)
+    .run(contentID, categoryIndex, Server.$.params.value);
+});
+const cmdToggleFlagDisabled = Server.command((categoryIndex, contentID) => {
+  const contentKey = db.query(`UPDATE ${DBTbl.Content} SET flagsDisabled=((flagsDisabled & ~${DisabledFlag.USER}) | ?3) WHERE contentID=?1 AND categoryIndex=?2 RETURNING contentKey`)
+    .get(contentID, categoryIndex, Server.$.params.state ? 0 : DisabledFlag.USER)?.contentKey;
+  if (contentKey) Hooks.trigger('core.alteration', { categoryIndex: categoryIndex, contentKey, invalidateList: true });
+});
+const cmdToggleFlagSearchable = Server.command((categoryIndex, contentID) => {
+  const contentKey = db.query(`UPDATE ${DBTbl.Content} SET flagSearcheable=?3 WHERE contentID=?1 AND categoryIndex=?2 RETURNING contentKey`)
+    .get(contentID, categoryIndex, Server.$.params.state)?.contentKey;;
+  if (contentKey) Hooks.trigger('core.alteration', { categoryIndex: categoryIndex, contentKey, invalidateList: true });
+});
+const cmdToggleFlagLimited = Server.command((categoryIndex, contentID) => {
+  const contentKey = db.query(`UPDATE ${DBTbl.Content} SET flagLimited=?3 WHERE contentID=?1 AND categoryIndex=?2 RETURNING contentKey`)
+    .get(contentID, categoryIndex, Server.$.params.state)?.contentKey;
+  if (contentKey) Hooks.trigger('core.alteration', { categoryIndex: categoryIndex, contentKey, invalidateList: true });
+});
+const cmdToggleFlagOriginal = Server.command((categoryIndex, contentID) => {
+  const contentKey = db.query(`UPDATE ${DBTbl.Content} SET flagOriginal=?3 WHERE contentID=?1 AND categoryIndex=?2 RETURNING contentKey`)
+    .get(contentID, categoryIndex, Server.$.params.state)?.contentKey;
+  if (contentKey) Hooks.trigger('core.alteration', { categoryIndex: categoryIndex, contentKey, invalidateList: true });
+});
+const cmdToggleListStyle = Server.command(userKey => {
+  db.storage.set(`user.oldStyle.${userKey}`, db.storage.get(`user.oldStyle.${userKey}`) ? null : true);
 });
 
 Server.get('/manage/group/:groupID', $ => {
-  const items = db.query(`SELECT c.contentKey AS contentKey, c.categoryIndex AS categoryIndex, c.contentID AS contentID, c.createdDate AS createdDate, c.updatedDate AS updatedDate, c.countDownloads AS countDownloads, c.countComplains AS countComplains, c.flagsDisabled AS flagsDisabled, c.dataAuthor AS dataAuthor, c.dataName AS dataName, c.dataVersion AS dataVersion, c.flagSearcheable AS flagSearcheable, GROUP_CONCAT(a.contentID, ", ") AS alternativeIds FROM ${DBTbl.Content} c LEFT JOIN ${DBTbl.AlternativeIDs} a ON c.contentKey = a.contentKey WHERE c.userKey=?1 AND c.groupKey=?2 GROUP BY c.contentID ${DBTbl.Content.order('c')}`).all($.user.userKey, $.group.groupKey);
+  if (!$.group) {
+    return <Co.Page title="No such group">
+      <ul class="form">
+        <p>No group with ID <b>{$.params.groupID}</b>.</p>
+        <hr />
+        <Co.InlineMenu>
+          <Co.Link action="/manage/group" args={{ value: $.params.groupID }}>Create group</Co.Link>
+        </Co.InlineMenu>
+      </ul>
+    </Co.Page>
+  }
+  const items = db.query(`SELECT 
+    c.contentKey AS contentKey, 
+    c.categoryIndex AS categoryIndex, 
+    c.contentID AS contentID, 
+    c.createdDate AS createdDate,
+    c.updatedDate AS updatedDate, 
+    c.countDownloads AS countDownloads, 
+    c.countComplains AS countComplains, 
+    c.flagsDisabled AS flagsDisabled, 
+    c.dataAuthor AS dataAuthor,
+    c.dataName AS dataName,
+    c.dataVersion AS dataVersion,
+    c.flagSearcheable AS flagSearcheable, 
+    c.flagLimited AS flagLimited, 
+    c.flagOriginal AS flagOriginal, 
+    GROUP_CONCAT(a.contentID, ", ") AS alternativeIds 
+    FROM ${DBTbl.Content} c 
+    LEFT JOIN ${DBTbl.AlternativeIDs} a ON c.contentKey = a.contentKey 
+    WHERE c.userKey=?1 AND c.groupKey=?2 
+    GROUP BY c.contentID
+    ${DBTbl.Content.order('c')}`).all($.user.userKey, $.group.groupKey);
+
+  if (!db.storage.get(`user.oldStyle.${$.user.userKey}`)) {
+    return <Co.Page title={$.groups.length > 1 ? `Group/${$.group.name}` : 'Your content'} search>
+      {items.length == 0 ? <ul></ul> :
+        <table class="advtable">
+          <tr>
+            <th onclick="reorder(this)" style="width:40px" rowspan="2">Type</th>
+            <th onclick="reorder(this, null, true)" data-sort="1" rowspan="2">Entry</th>
+            <th onclick="reorder(this)" rowspan="2" style="width:80px">Version</th>
+            <th onclick="reorder(this)" rowspan="2">Author</th>
+            <th onclick="reorder(this)" rowspan="2" style="width:140px">Created</th>
+            <th colspan="2">Stats</th>
+            <th colspan="4">Flags</th>
+          </tr>
+          <tr>
+            <th onclick="reorder(this, 5)" title={Locale.hints.countDownloads} style="width:80px;font-size:0.8em">Downloads</th>
+            <th onclick="reorder(this, 6)" title={Locale.hints.countComplains} style="width:80px;font-size:0.8em">Complains</th>
+            <th onclick="reorder(this, 7)" style="width:68px;font-size:0.8em">Enabled</th>
+            <th onclick="reorder(this, 8)" title={Locale.hints.flagSearcheable} style="width:68px;font-size:0.8em">Searchable</th>
+            <th onclick="reorder(this, 9)" title={Locale.hints.flagLimited} style="width:68px;font-size:0.8em">Limited</th>
+            <th onclick="reorder(this, 10)" title={Locale.hints.flagOriginal} style="width:68px;font-size:0.8em">Scratch-made</th>
+          </tr>
+          {ContentCategories.map((c, i) => [c, items.filter(x => x.categoryIndex == i)]).filter(e => e[1].length > 0).map(([c, items]) => items.map((x, i) => <>
+            <G $id={x.contentKey} />
+            <tr class="mainrow" data-search={[x.contentID, x.dataName, x.dataVersion, x.dataAuthor].filter(Boolean).join('\n')}>
+              <th data-sortable-cell rowspan={items.length * 2} data-search-attr={`rowspan:2:${items.length * 2}`} class={i === 0 ? null : "search-unhide"}>{c.title}</th>
+              <td>
+                <Co.Link href={U`/manage/${ContentCategories[x.categoryIndex].id}/${x.contentID}`}>{x.dataName || x.contentID}</Co.Link></td>
+              <td>{x.dataVersion}</td>
+              <td>
+                {x.dataAuthor}
+                <Co.Link query={`Author for ${x.contentID}:`} default={x.dataAuthor} action={cmdSetAuthorName(x.categoryIndex, x.contentID)}>✍</Co.Link></td>
+              <td><Co.Date value={x.createdDate} /></td>
+              <td>{x.countDownloads}</td>
+              <td>{x.countComplains}</td>
+              <td><Co.Switch state={!(x.flagsDisabled & DisabledFlag.USER)} action={cmdToggleFlagDisabled(x.categoryIndex, x.contentID)} /></td>
+              <td><Co.Switch state={x.flagSearcheable} action={cmdToggleFlagSearchable(x.categoryIndex, x.contentID)} /></td>
+              <td><Co.Switch state={x.flagLimited} action={cmdToggleFlagLimited(x.categoryIndex, x.contentID)} /></td>
+              <td><Co.Switch state={x.flagOriginal} action={cmdToggleFlagOriginal(x.categoryIndex, x.contentID)} /></td>
+            </tr>
+            <tr class="details">
+              <td>
+                {x.flagsDisabled & DisabledFlag.BLOCKED ? <Co.Value title="blocked" class="warn">Blocked</Co.Value>
+                  : x.flagsDisabled & DisabledFlag.HIDDEN ? <Co.Value title="hidden" class="warn">Hidden</Co.Value>
+                    : x.flagsDisabled & DisabledFlag.PROCESSING ? <Co.Value title="processing" class="notice">Processing</Co.Value>
+                      : null}
+              </td>
+              <td colspan="4" style="text-align:left">
+                {`ID: ${x.contentID}${x.alternativeIds ? `, also includes: ${x.alternativeIds}` : ''}`}
+              </td>
+              <td colspan="5">
+                <Co.InlineMenu>
+                  {$.groups.length > 1 ? <Co.Link action="/manage/command/content-move" args={{ contentID: x.contentID, categoryID: ContentCategories[x.categoryIndex].id, groupID: $.groups.map(x => ({ value: x.groupID, name: x.name, selected: x.groupID === $.group.groupID })), location: 'current' }}>Move to</Co.Link> : null}
+                  <Co.Link action={U`/manage/${ContentCategories[x.categoryIndex].id}/${x.contentID}`} args={{ 'delete': true, location: 'current' }} query={`Delete ${x.contentID}?`}>Delete…</Co.Link>
+                </Co.InlineMenu>
+              </td>
+            </tr>
+          </>))}
+        </table>
+      }
+      <hr />
+      <Co.InlineMenu>
+        <Co.Dropdown href="#" label="Add…">{Hooks.trigger('core.menu.add', ContentCategories.filter(x => !x.limited || $.user.allowedFilter === '*').map(n => <Co.Link action={U`/manage/group/${$.params.groupID}`} args={{ categoryID: n.id }} query={`New ${n.name} ID (if there are several, list the first one):`}>Add {n.name}…</Co.Link>))}</Co.Dropdown>
+        <Co.Link action="/manage/command/group-rename" args={{ groupID: $.params.groupID }} query="New name:" default={$.group.name}>Rename group…</Co.Link>
+        <Co.Link action={cmdToggleListStyle($.user.userKey)}>Switch to list view</Co.Link>
+      </Co.InlineMenu>
+    </Co.Page>;
+  }
+
   return <Co.Page title={$.groups.length > 1 ? `Group/${$.group.name}` : 'Your content'}>
     <ul class="form">{ContentCategories.map((c, i) => [c, items.filter(x => x.categoryIndex == i)]).filter(e => e[1].length > 0).map(([c, items]) => <>
       <h3>{c.title}s</h3>{items.map(x =>
         <li class="details">
-          <Co.Link href={`/manage/${ContentCategories[x.categoryIndex].id}/${x.contentID}`}>{x.dataName ? `${x.dataName} (${x.contentID})` : x.contentID}</Co.Link>
+          <Co.Link href={U`/manage/${ContentCategories[x.categoryIndex].id}/${x.contentID}`}>{x.dataName ? `${x.dataName} (${x.contentID})` : x.contentID}</Co.Link>
           <div>
             <Co.InlineMenu>
               {x.dataVersion != null ? <>v{x.dataVersion}</> : null}
-              {x.dataVersion != null ? <>Author: {x.dataAuthor}</> : null}
+              {x.dataAuthor != null ? <>Author: {x.dataAuthor}</> : null}
               {x.countDownloads > 0 ? <Co.Value title="countDownloads">Downloads: {x.countDownloads}</Co.Value> : null}
               {x.countComplains > 0 ? <Co.Value title="countComplains">Complains: {x.countComplains}</Co.Value> : null}
               <>Created: <Co.Date value={x.createdDate} /></>
@@ -115,10 +251,11 @@ Server.get('/manage/group/:groupID', $ => {
                   : x.flagsDisabled & DisabledFlag.HIDDEN ? <Co.Value title="hidden" class="warn">Hidden</Co.Value>
                     : x.flagsDisabled & DisabledFlag.PROCESSING ? <Co.Value title="processing" class="notice">Processing</Co.Value>
                       : null}
-              {x.flagSearcheable ? <Co.Value title="flagSearcheable">Searcheable</Co.Value> : ''}
+              {x.flagSearcheable ? <Co.Value title="flagSearcheable">Searchable</Co.Value> : ''}
               {$.groups.length > 1 ? <Co.Link action="/manage/command/content-move" args={{ contentID: x.contentID, categoryID: ContentCategories[x.categoryIndex].id, groupID: $.groups.map(x => ({ value: x.groupID, name: x.name, selected: x.groupID === $.group.groupID })), location: 'current' }}>Group</Co.Link> : null}
               <Co.Link action="/manage/command/content-toggle" args={{ contentID: x.contentID, categoryID: ContentCategories[x.categoryIndex].id, state: x.flagsDisabled & DisabledFlag.USER, location: 'current' }}>{x.flagsDisabled & DisabledFlag.USER ? 'Enable' : 'Disable'}</Co.Link>
-              <Co.Link action={`/manage/${ContentCategories[x.categoryIndex].id}/${x.contentID}`} args={{ 'delete': true, location: 'current' }} query={`Delete ${x.contentID}?`}>Delete…</Co.Link>
+              <Co.Link action="/manage/command/content-searchable-toggle" args={{ contentID: x.contentID, categoryID: ContentCategories[x.categoryIndex].id, state: !x.flagSearcheable, location: 'current' }}>{x.flagSearcheable ? 'Remove from search' : 'Add to search'}</Co.Link>
+              <Co.Link action={U`/manage/${ContentCategories[x.categoryIndex].id}/${x.contentID}`} args={{ 'delete': true, location: 'current' }} query={`Delete ${x.contentID}?`}>Delete…</Co.Link>
             </Co.InlineMenu>
             {x.alternativeIds ? <><br />Also includes: {x.alternativeIds}</> : null}
           </div>
@@ -126,8 +263,9 @@ Server.get('/manage/group/:groupID', $ => {
     </ul><ul>
       <hr />
       <Co.InlineMenu>
-        <Co.Dropdown href="#" label="Add…">{ContentCategories.filter(x => !x.limited || $.user.allowedFilter === '.').map(n => <Co.Link action={`/manage/group/${$.params.groupID}`} args={{ categoryID: n.id }} query={`New ${n.name} ID (if there are several, list the first one):`}>Add {n.name}…</Co.Link>)}</Co.Dropdown>
+        <Co.Dropdown href="#" label="Add…">{ContentCategories.filter(x => !x.limited || $.user.allowedFilter === '*').map(n => <Co.Link action={U`/manage/group/${$.params.groupID}`} args={{ categoryID: n.id }} query={`New ${n.name} ID (if there are several, list the first one):`}>Add {n.name}…</Co.Link>)}</Co.Dropdown>
         <Co.Link action="/manage/command/group-rename" args={{ groupID: $.params.groupID }} query="New name:" default={$.group.name}>Rename group…</Co.Link>
+        <Co.Link action={cmdToggleListStyle($.user.userKey)}>Switch to table view</Co.Link>
       </Co.InlineMenu>
     </ul>
   </Co.Page>;
@@ -146,25 +284,15 @@ Server.post('/manage/group/:groupID', $ => {
   if ($.userData.flagLimited) w.query(`UPDATE ${DBTbl.Content} SET flagLimited=true WHERE contentKey=?1`).run(contentKey);
   if ($.userData.cleanInstallation) w.query(`UPDATE ${DBTbl.Content} SET contentData=?2 WHERE contentKey=?1`).run(contentKey, JSON.stringify({ cleanInstallation: true }));
 
-  return `/manage/${$.params.categoryID}/${$.id}`;
+  return U`/manage/${$.params.categoryID}/${$.id}`;
 });
 
-function authorSuggestions($, userKey) {
-  const r = db.query(`SELECT dataAuthor, COUNT(*) AS count FROM ${DBTbl.Content} WHERE userKey=?1 GROUP BY dataAuthor ORDER BY count DESC`).all(userKey).map(x => x.dataAuthor);
-  if (userKey == $.user.userKey) {
-    if ($.userData.dataAuthor && !r.includes($.userData.dataAuthor)) r.push($.userData.dataAuthor);
-    if ($.userData.profileName && !r.includes($.userData.profileName)) r.push($.userData.profileName);
-  }
-  return r;
-}
-
 Server.get('/manage/:categoryID/:contentID', $ => {
-  $.user;
-
   const entry = db.query(`SELECT * FROM ${DBTbl.Content} WHERE categoryIndex=?1 AND contentID=?2`).get($.categoryIndex, $.params.contentID);
   if (!entry) return null;
+
   const contentData = JSON.parse(entry.contentData);
-  const liveUpdating = $.liveUpdating(entry.flagsDisabled & DisabledFlag.PROCESSING ? 3 : 10, <>
+  const liveUpdating = $.liveUpdating(entry.flagsDisabled & DisabledFlag.PROCESSING ? '3 s' : '10 s', <>
     {(entry.flagsDisabled & DisabledFlag.BLOCKED)
       ? <li class="warn">Blocked: <Co.Value title={contentData.blockedReason ? `Reason: ${contentData.blockedReason}` : Locale.hints.blocked}>yes</Co.Value></li>
       : null}
@@ -177,7 +305,32 @@ Server.get('/manage/:categoryID/:contentID', $ => {
   </>, <>
     <li><Co.Value title="countDownloads">Downloads: {entry.countDownloads}</Co.Value></li>
     <li><Co.Value title="countComplains">Complains: {entry.countComplains}</Co.Value></li>
-  </>);
+  </>, entry.flagsDisabled === 0 && contentData.updateUrl && !entry.flagLimited
+    ? <Co.Link href={U`/registry/${$.params.categoryID}/${entry.contentID}/get`} title="You can use this URL for a quick download on your website or social media to count downloads" onclick={`navigator.clipboard.writeText(this.href);this.textContent="Download URL copied"`}>Copy download URL</Co.Link>
+    : <Co.Link disabled title="Download URLs won’t work for disabled, hidden, blocked entries, or entries being processed">Download URL is not available</Co.Link>);
+
+  const alternativeIds = db.query(`SELECT * FROM ${DBTbl.AlternativeIDs} WHERE contentKey=?1`).all(entry.contentKey).map(x => x.contentID);
+  if (!$.signed) {
+    if (entry.flagsDisabled & DisabledFlag.USER) return null;
+    const contentData = JSON.parse(entry.contentData);
+    return <Co.Page center title={<>{entry.dataName ? `${entry.dataName} (${entry.contentID})` : entry.contentID}</>}>
+      {liveUpdating[0]}
+      <li>Author: <Co.UserLink userID={DBTbl.Users.userID(entry.userKey)} /></li>
+      <li>Downloads: <Co.Value title="countDownloads">{entry.countDownloads}</Co.Value></li>
+      <li>Created: <Co.Date value={entry.createdDate} /></li>
+      <li>Updated: <Co.Date value={entry.updatedDate} /></li>
+      <li>Version: <Co.Value placeholder="not set">{entry.dataVersion}</Co.Value></li>
+      {alternativeIds.length > 0
+        ? <li>Also includes <Co.Value>{alternativeIds.join(', ')}</Co.Value></li>
+        : null}
+      {contentData.informationUrl
+        ? <li>More information: <Co.Value><a href={contentData.informationUrl}>{contentData.informationUrl}</a></Co.Value></li>
+        : null}
+      <Co.Tags tags={[ContentCategories[entry.categoryIndex].id, entry.flagSearcheable && 'searchable', entry.flagOriginal && 'scratch-made' || 'ported']} />
+    </Co.Page>
+  }
+
+  $.user;
 
   const group = $.groups.filter(x => x.groupKey === entry.groupKey)[0];
   if (group) $.currentGroup = group.groupID;
@@ -187,41 +340,42 @@ Server.get('/manage/:categoryID/:contentID', $ => {
   const extras = {
     active: (entry.flagsDisabled & DisabledFlag.USER) === 0,
     blocked: (entry.flagsDisabled & DisabledFlag.BLOCKED) !== 0,
-    alternativeIds: db.query(`SELECT * FROM ${DBTbl.AlternativeIDs} WHERE contentKey=?1`).all(entry.contentKey).map(x => x.contentID).join('\n')
+    alternativeIds: alternativeIds.join('\n')
   };
   return <Co.Page title={<>
-    {group && $.groups.length > 1 ? <><a href={`/manage/group/${group.groupID}`}>{group.name}</a>/</> : null}
+    {group && $.groups.length > 1 ? <><a href={U`/manage/group/${group.groupID}`}>{group.name}</a>/</> : null}
     {ContentCategories[entry.categoryIndex].title}: {entry.dataName ? `${entry.dataName} (${entry.contentID})` : entry.contentID}
   </>}>
     {editable ? <Co.MainForm.Start /> : null}
     <ul class="form">
       {liveUpdating[0]}
-      {authorID ? <li>Author: <Co.UserURL userID={authorID} /></li> : null}
+      {authorID ? <li>Author: <Co.UserLink userID={authorID} /></li> : null}
       <li>Created: <Co.Date value={entry.createdDate} /></li>
       <li>Updated: <Co.Date value={entry.updatedDate} /></li>
       {liveUpdating[1]}
-      {editable ? <>
+      {editable ? <G $hook={{ 'core.tpl.content.editorRows': { entry, contentData } }}>
         <hr />
         {group && $.groups.length > 1 ? <li><label for="group">Group</label><select id="group" name="data-group">{$.groups.map(x => <option value={x.groupID} selected={x.groupKey === entry.groupKey}>{x.name}</option>)}</select></li> : null}
         <Co.Row key="active" data={extras} default={true}>Active</Co.Row>
         <Co.Row key="alternativeIds" data={extras} multiline>Alternate IDs</Co.Row>
         <Co.Row key="dataName" data={entry} placeholder={entry.contentID}>Name</Co.Row>
-        <Co.Row key="dataAuthor" data={entry} placeholder={$.userData.dataAuthor} options={authorSuggestions($, entry.userKey)}>Author</Co.Row>
+        <Co.Row key="dataAuthor" data={entry} placeholder={$.userData.dataAuthor} options={$.authorSuggestions(entry.userKey)}>Author</Co.Row>
         <Co.Row key="dataVersion" data={entry} placeholder="0" attributes={{ 'data-version-input': true }}>Version</Co.Row>
         <Co.Row key="changelog" data={contentData} multiline>Changelog</Co.Row>
         <Co.Row key="informationUrl" data={contentData}>Information URL</Co.Row>
         <Co.Row key="updateUrl" input-hook="core.tpl.content.uploadURL" data={contentData}>Update URL</Co.Row>
-        <Co.Row key="flagLimited" data={entry} default={false}>Limited</Co.Row>
-        <Co.Row key="cleanInstallation" data={contentData} default={false}>Clean installation</Co.Row>
-        {ContentCategories[entry.categoryIndex].portable && $.can(Access.FLAG_ORIGINAL) ? <Co.Row key="flagOriginal" data={entry} default={false}>Original content</Co.Row> : null}
-        {$.can(Access.FLAG_SEARCHEABLE) ? <Co.Row key="flagSearcheable" data={entry} default={true}>Allow search</Co.Row> : null}
-      </> : null}
+        <Co.Row key="flagLimited" data={entry} default={false}>Disable direct downloads</Co.Row>
+        <Co.Row key="cleanInstallation" data={contentData} default={false}>Force clean installation</Co.Row>
+        {ContentCategories[entry.categoryIndex].portable && $.can(Access.FLAG_ORIGINAL) ? <Co.Row key="flagOriginal" data={entry} default={false}>Scratch-made</Co.Row> : null}
+        {$.can(Access.FLAG_SEARCHEABLE) ? <Co.Row key="flagSearcheable" data={entry} default={true}>Allow searching for</Co.Row> : null}
+      </G> : null}
     </ul><ul class="form">
       <hr />
       {editable ? <Co.InlineMenu>
         <Co.MainForm.End>Save changes</Co.MainForm.End>
+        {liveUpdating[2]}
         <Co.Link action="/manage/command/content-reset-complains" args={{ contentID: entry.contentID, categoryID: $.params.categoryID }} query={`Reset complains counter for ${entry.contentID}?`}>Reset complains counter…</Co.Link>
-        <Co.Link action={`/manage/${$.params.categoryID}/${entry.contentID}`} args={{ 'delete': true }} query={`Delete ${entry.contentID}?`}>Delete entry…</Co.Link>
+        <Co.Link action={U`/manage/${$.params.categoryID}/${entry.contentID}`} args={{ 'delete': true }} query={`Delete ${entry.contentID}?`}>Delete entry…</Co.Link>
         {$.can(Access.MODERATE)
           ? <Co.Link action="/manage/command/content-block" args={{ contentID: entry.contentID, categoryID: $.params.categoryID }} query={!extras.blocked && `Block reason for ${entry.contentID}:`}>{extras.blocked ? `Unblock ${ContentCategories[entry.categoryIndex].name}` : `Block ${ContentCategories[entry.categoryIndex].name}…`}</Co.Link> : null}
         {extras.blocked && !$.can(Access.MODERATE)
@@ -233,36 +387,45 @@ Server.get('/manage/:categoryID/:contentID', $ => {
   </Co.Page>;
 });
 
-Server.post('/manage/:categoryID/:contentID', $ => {
-  const entry = db.query(`SELECT * FROM ${DBTbl.Content} WHERE categoryIndex=?1 AND contentID=?2`).get($.categoryIndex, $.params.contentID);
+const downloadableContent = new DownloadableSource('c', DBTbl.Content, (entry, processing, errorMessage) => {
   const curData = JSON.parse(entry.contentData);
-  $.writes(entry);
+  if (entry.flagsDisabled.hasFlag(DisabledFlag.PROCESSING) != !processing
+    && entry.flagsDisabled.hasFlag(DisabledFlag.HIDDEN) != !errorMessage
+    && entry.hiddenUpdateUrlReason === errorMessage) return;
+
+  curData.hiddenUpdateUrlReason = errorMessage;
+  DBTbl.Content.update(entry.contentKey, {
+    flagsDisabled: entry.flagsDisabled.setFlag(DisabledFlag.PROCESSING, processing).setFlag(DisabledFlag.HIDDEN, errorMessage || curData.hiddenReasons),
+    contentData: DBTbl.Content.encodeContentData(curData)
+  });
+
+  if ((!processing && !errorMessage) != (entry.flagsDisabled === 0)) {
+    Hooks.trigger('core.alteration', { categoryIndex: entry.categoryIndex, contentKey: entry.contentKey, invalidateList: true });
+  }
+}, contentKey => {
+  const entry = db.query(`SELECT categoryIndex, contentID, dataName FROM ${DBTbl.Content} WHERE contentKey=?1`).get(contentKey);
+  return entry && <Co.Link href={U`/manage/${ContentCategories[entry.categoryIndex].id}/${entry.contentID}`}>{ContentCategories[entry.categoryIndex].name} {entry.dataName || entry.contentID}</Co.Link>;
+});
+
+Server.post('/manage/:categoryID/:contentID', $ => {
+  const entry = $.writes(db.query(`SELECT * FROM ${DBTbl.Content} WHERE categoryIndex=?1 AND contentID=?2`).get($.categoryIndex, $.params.contentID));
+  if (!entry) return null;
+
+  const curData = JSON.parse(entry.contentData);
+  Hooks.trigger('core.post.content.editorRows', { $, entry, contentData: curData });
 
   if ($.params.delete) {
     const curIDs = db.query(`SELECT * FROM ${DBTbl.AlternativeIDs} WHERE contentKey=?1`).all(entry.contentKey).map(x => x.contentID);
-    $.undo(`${ContentCategories[entry.categoryIndex].title} ${entry.contentID} removed`, $ => {
+    $.undo(`${ContentCategories[entry.categoryIndex].title} ${entry.contentID} removed.`, $ => {
       $.verifyID(entry.categoryIndex, entry.contentID);
-      delete entry.contentKey;
-      const key = DBTbl.Content.insert(entry);
+      if (DBTbl.Content.exists(entry.contentKey)) delete entry.contentKey;
+      entry.contentKey = DBTbl.Content.insert(entry);
       for (const id of curIDs) {
         $.verifyID(entry.categoryIndex, id);
-        db.query(`INSERT INTO ${DBTbl.AlternativeIDs} (contentKey, categoryIndex, contentID) VALUES (?1, ?2, ?3)`).run(key, entry.categoryIndex, id);
+        db.query(`INSERT INTO ${DBTbl.AlternativeIDs} (contentKey, categoryIndex, contentID) VALUES (?1, ?2, ?3)`).run(entry.contentKey, entry.categoryIndex, id);
       }
-      Hooks.trigger('core.alteration', { categoryIndex: entry.categoryIndex, contentKey: key, invalidateList: true });
-
-      const args = Hooks.trigger('data.downloadURL.change', {
-        $, key: `c${entry.contentKey}`,
-        oldValue: null, newValue: curData.updateUrl,
-        processing: false, errorMsg: null
-      });
-      if (args.processing !== ((entry.flagsDisabled & DisabledFlag.PROCESSING) != 0)) {
-        entry.flagsDisabled = Utils.bitFlag(entry.flagsDisabled, DisabledFlag.PROCESSING, args.processing);
-        db.query(`UPDATE ${DBTbl.Content} SET flagsDisabled=?2 WHERE contentKey=?1`).run(entry.contentKey, entry.flagsDisabled);
-      }
-      if (args.errorMsg != curData.hiddenUpdateUrlReason) {
-        curData.hiddenUpdateUrlReason = args.errorMsg;
-        db.query(`UPDATE ${DBTbl.Content} SET contentData=?2 WHERE contentKey=?1`).run(entry.contentKey, DBTbl.Content.encodeContentData(curData));
-      }
+      Hooks.trigger('core.alteration', { categoryIndex: entry.categoryIndex, contentKey: entry.contentKey, invalidateList: true });
+      downloadableContent.report(entry, false, curData.updateUrl);
     });
     {
       using _ = db.write().start();
@@ -270,8 +433,8 @@ Server.post('/manage/:categoryID/:contentID', $ => {
       db.query(`DELETE FROM ${DBTbl.AlternativeIDs} WHERE contentKey=?1`).run(entry.contentKey);
     }
     Hooks.trigger('core.alteration', { categoryIndex: entry.categoryIndex, contentKey: entry.contentKey, invalidateList: true });
-    Hooks.trigger('data.downloadURL.change', { $, key: `c${entry.contentKey}`, oldValue: curData.updateUrl, newValue: null });
-    return `/manage/group/${db.query(`SELECT groupID FROM ${DBTbl.Groups} WHERE groupKey=?1`).get(entry.groupKey).groupID}`;
+    downloadableContent.report(entry, curData.updateUrl, false);
+    return U`/manage/group/${db.query(`SELECT groupID FROM ${DBTbl.Groups} WHERE groupKey=?1`).get(entry.groupKey).groupID}`;
   }
 
   {
@@ -286,7 +449,7 @@ Server.post('/manage/:categoryID/:contentID', $ => {
     }, curData);
 
     const newEntry = $.form({
-      flagsDisabled: Utils.bitFlag(entry.flagsDisabled, DisabledFlag.USER, $.params['data-active'] !== 'on'),
+      flagsDisabled: entry.flagsDisabled.setFlag(DisabledFlag.USER, $.params['data-active'] !== 'on'),
       flagSearcheable: $.can(Access.FLAG_SEARCHEABLE) && db.row.boolean(),
       flagOriginal: $.can(Access.FLAG_ORIGINAL) && db.row.boolean(),
       flagLimited: db.row.boolean(),
@@ -296,18 +459,11 @@ Server.post('/manage/:categoryID/:contentID', $ => {
     }, entry);
 
     newData.hiddenReasons = ContentUtils.verifyValidity(newEntry, newData);
-    if (curData.updateUrl != null || newData.updateUrl != null) {
-      // Can spawn even if URL remains the same
-      const args = Hooks.trigger('data.downloadURL.change', {
-        $, key: `c${entry.contentKey}`,
-        oldValue: curData.updateUrl, newValue: newData.updateUrl,
-        processing: false, errorMsg: null
-      });
-      newData.hiddenUpdateUrlReason = args.errorMsg;
-      newEntry.flagsDisabled = Utils.bitFlag(newEntry.flagsDisabled, DisabledFlag.PROCESSING, args.processing);
-    }
-    newEntry.flagsDisabled = Utils.bitFlag(newEntry.flagsDisabled, DisabledFlag.HIDDEN,
-      newData.hiddenReasons.length > 0 || newData.hiddenUpdateUrlReason);
+    const downloadableState = downloadableContent.reportInline(entry, curData.updateUrl, newData.updateUrl);
+    newData.hiddenUpdateUrlReason = downloadableState.errorMsg;
+    newEntry.flagsDisabled = newEntry.flagsDisabled
+      .setFlag(DisabledFlag.PROCESSING, downloadableState.processing)
+      .setFlag(DisabledFlag.HIDDEN, newData.hiddenReasons.length > 0 || newData.hiddenUpdateUrlReason);
 
     if (newEntry.flagsDisabled != entry.flagsDisabled) {
       db.query(`UPDATE ${DBTbl.Content} SET flagsDisabled=?2 WHERE contentKey=?1`).run(entry.contentKey, newEntry.flagsDisabled);
@@ -338,6 +494,8 @@ Server.post('/manage/:categoryID/:contentID', $ => {
       categoryIndex: entry.categoryIndex,
       contentKey: entry.contentKey,
       invalidateList: newEntry.flagLimited !== entry.flagLimited
+        || newEntry.flagOriginal !== entry.flagOriginal
+        || newEntry.flagSearcheable !== entry.flagSearcheable
         || newEntry.dataVersion !== entry.dataVersion
         || (newEntry.flagsDisabled === 0) != (entry.flagsDisabled === 0)
     });
@@ -368,7 +526,7 @@ Server.post('/manage/:categoryID/:contentID', $ => {
     }
   }
 
-  return `/manage/${$.params.categoryID}/${$.params.contentID}`;
+  return U`/manage/${$.params.categoryID}/${$.params.contentID}`;
 });
 
 Server.get('/manage/group', $ => {
@@ -376,7 +534,7 @@ Server.get('/manage/group', $ => {
   return <Co.Page title="Groups">
     <ul class="form">{groups.map((x, i) =>
       <li class="details">
-        <a href={`/manage/group/${x.groupID}`}>{x.name} ({x.count})</a>
+        <a href={U`/manage/group/${x.groupID}`}>{x.name} ({x.count})</a>
         <div>
           <Co.InlineMenu>
             <Co.Link action="/manage/command/group-rename" args={{ groupID: x.groupID, location: 'current' }} query="New name:" default={x.name}>Rename group…</Co.Link>
@@ -428,10 +586,10 @@ const ProfileSettings = {
       <Co.Row data={userData} key="profileUrl">Details URL</Co.Row>
       <h3>Default content settings:</h3>
       <Co.Row data={userData} key="dataAuthor" options={db.query(`SELECT dataAuthor, COUNT(*) AS count FROM ${DBTbl.Content} WHERE userKey=?1 GROUP BY dataAuthor ORDER BY count DESC`).all(user.userKey).map(x => x.dataAuthor)}>Author name</Co.Row>
-      <Co.Row data={userData} key="flagLimited" default={false}>Limited</Co.Row>
-      <Co.Row data={userData} key="cleanInstallation" default={false}>Clean installation</Co.Row>
-      {$.can(Access.FLAG_ORIGINAL) ? <Co.Row data={userData} key="flagOriginal" default={false} forced-choice={intro}>Original content</Co.Row> : null}
-      {$.can(Access.FLAG_SEARCHEABLE) ? <Co.Row data={userData} key="flagSearcheable" default forced-choice={intro}>Allow search</Co.Row> : null}
+      <Co.Row data={userData} key="flagLimited" default={false}>Disable direct downloads</Co.Row>
+      <Co.Row data={userData} key="cleanInstallation" default={false}>Force clean installation</Co.Row>
+      {$.can(Access.FLAG_ORIGINAL) ? <Co.Row data={userData} key="flagOriginal" default={false} forced-choice={intro}>Scratch-made</Co.Row> : null}
+      {$.can(Access.FLAG_SEARCHEABLE) ? <Co.Row data={userData} key="flagSearcheable" default={true} forced-choice={intro}>Allow searching for</Co.Row> : null}
       <i $hook="core.tpl.userEditor">These settings are the ones used by default for new content entries. You can always change it for individual entries later.</i>
       <h3><span title="Just in case somebody would want to reach you (keep in mind, your contacts are publicly visible)">Contacts</span>:</h3>
       <Co.Row data={contacts} key="mail" attributes={{ type: 'email' }}>E-mail</Co.Row>
@@ -473,7 +631,7 @@ const ProfileSettings = {
     if (total.length === 0) return null;
     return <>
       <hr />{ContentCategories.map((v, i) => [v.title, total.filter(y => y.categoryIndex == i)]).filter(x => x[1].length).map(x => <>
-        <h3>{x[0]}s:</h3>{x[1].map(x => <li data-disabled={x.flagsDisabled !== 0}><a href={`/manage/${ContentCategories[x.categoryIndex].id}/${x.contentID}`}>{x.dataName && x.dataName !== x.contentID ? `${x.dataName} (${x.contentID}${x.flagsDisabled & DisabledFlag.BLOCKED ? ', blocked' : x.flagsDisabled & DisabledFlag.USER ? ', disabled' : ''})` : `${x.contentID}${x.flagsDisabled & DisabledFlag.BLOCKED ? ' (blocked)' : x.flagsDisabled & DisabledFlag.USER ? ' (disabled)' : ''}`}</a>{x.alternativeIds ? <><br /><span class="details">Also includes: {x.alternativeIds}</span></> : null}</li>)}
+        <h3>{x[0]}s:</h3>{x[1].map(x => <li data-disabled={x.flagsDisabled !== 0}><a href={U`/manage/${ContentCategories[x.categoryIndex].id}/${x.contentID}`}>{x.dataName && x.dataName !== x.contentID ? `${x.dataName} (${x.contentID}${x.flagsDisabled & DisabledFlag.BLOCKED ? ', blocked' : x.flagsDisabled & DisabledFlag.USER ? ', disabled' : ''})` : `${x.contentID}${x.flagsDisabled & DisabledFlag.BLOCKED ? ' (blocked)' : x.flagsDisabled & DisabledFlag.USER ? ' (disabled)' : ''}`}</a>{x.alternativeIds ? <><br /><span class="details">Also includes: {x.alternativeIds}</span></> : null}</li>)}
       </>)}
     </>;
   },
@@ -537,7 +695,7 @@ const ProfileSettings = {
 
 Server.get('/manage/introduction', $ => {
   // $.user.introduced = false; // TODO
-  if ($.user.introduced) return `/manage/user/${$.user.userID}`;
+  if ($.user.introduced) return U`/manage/user/${$.user.userID}`;
   return <Co.Page title={`Hello, ${$.userData.name || $.user.userID}`}>
     <ul class="form">
       <Co.MainForm.Start />
@@ -545,13 +703,14 @@ Server.get('/manage/introduction', $ => {
       <ProfileSettings.Editor user={$.user} userData={$.userData} ctx$={$} intro={true} />
       <hr />
       <input type="hidden" name="redirect" value={$.params.redirect || ''} />
-      <Co.MainForm.End>Save & continue</Co.MainForm.End>
+      <Co.MainForm.End active>Save & continue</Co.MainForm.End>
     </ul>
   </Co.Page>;
 });
 
 Server.post('/manage/introduction', $ => {
   ProfileSettings.save($, $.user.userID);
+  Hooks.trigger('core.introduction.complete', $);
   return $.params.redirect || '/manage';
 });
 
@@ -573,9 +732,11 @@ Server.get('/manage/user/:userID', $ => {
         <hr />
         <Co.InlineMenu $hook={{ 'core.tpl.userPage.menu': { user } }}>
           <Co.MainForm.End>Save changes</Co.MainForm.End>
-          {$.can(Access.MODERATE)
-            ? <Co.Link action="/manage/command/user-change-password" args={{ userID: user.userID }} query="New password:">Change password…</Co.Link>
-            : <Co.Link href="/manage/tool/password">Change password…</Co.Link>}
+          {!$.can(Access.MODERATE)
+            ? <Co.Link href="/manage/tool/password">Change password…</Co.Link>
+            : $.can(Access.ADMIN)
+              ? <Co.Link action="/manage/command/user-change-password" args={{ userID: user.userID }} query="New password:">Change password…</Co.Link>
+              : null}
           {user.allowedFilter && !$.can(Access.MODERATE)
             ? <Co.Link feedback={`I want to change content ID filter`}>Request ID filter change…</Co.Link>
             : null}
@@ -599,13 +760,13 @@ Server.get('/manage/user/:userID', $ => {
 
 Server.post('/manage/user/:userID', $ => {
   ProfileSettings.save($, $.params.userID);
-  return `/manage/user/${$.params.userID}`;
+  return U`/manage/user/${$.params.userID}`;
 });
 
 // Index page:
 Server.get('/', $ => new Response(formatGenericPage($, <Co.Page title="Hello World!" center>
   <G $hook="core.tpl.index.content">
-    <p>CUP is a solution for content creators to auto-update their content or add it to a searcheable registry for users to access.</p>
+    <p>CUP is a solution for content creators to auto-update their content or add it to a searchable registry for users to access.</p>
   </G>
   <p>
     <Co.InlineMenu $hook="core.tpl.index.menu">
@@ -620,10 +781,14 @@ Server.get('/', $ => new Response(formatGenericPage($, <Co.Page title="Hello Wor
   const resArgs = { headers: { 'Cache-Control': 'max-age=604800, public' } };
   const filesCache = new LazyMap(k => {
     if (k.endsWith('.js') || k.endsWith('.css')) {
-      const data = [('' + fs.readFileSync('res/' + k)).replace(/(?<=^|\n)\/.*@include:(.+)\s*(?=\n)/g, (_, f) => fs.readFileSync(`res/${f.trim()}`))];
-      Hooks.poll('core.res.' + k, data, filename => data.unshift(fs.readFileSync(filename)));
-      return ((d, h) => new Response(d, h)).bind(null, Bun.deflateSync(data.join('\n')),
-        { headers: { 'Content-Type': Bun.file('res/' + k).type, 'Cache-Control': 'max-age=604800, public', 'Content-Encoding': 'deflate' } });
+      try {
+        const data = [('' + fs.readFileSync('res/' + k)).replace(/(?<=^|\n)\/.*@include:(.+)\s*(?=\n)/g, (_, f) => fs.readFileSync(`res/${f.trim()}`))];
+        Hooks.poll('core.res.' + k, data, filename => data.unshift(fs.readFileSync(filename)));
+        return ((d, h) => new Response(d, h)).bind(null, Bun.deflateSync(prepareAsset(k.endsWith('.css') ? 'css' : 'js', data.join('\n'))),
+          { headers: { 'Content-Type': Bun.file('res/' + k).type, 'Cache-Control': 'max-age=604800, public', 'Content-Encoding': 'deflate' } });
+      } catch (e) {
+        return () => new Response(null, { status: 404, headers: resArgs.headers });
+      }
     }
     return () => new Response(Bun.file(k.startsWith('icon.') ? `${AppSettings.core.resDir}/favicon.ico` : `${AppSettings.core.resDir}/${k}`), resArgs);
   });

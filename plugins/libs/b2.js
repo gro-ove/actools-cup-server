@@ -64,6 +64,7 @@ function endpoints(b2) {
     listPartsUrl: `${apiUrl}/b2_list_parts`,
     hideFileUrl: `${apiUrl}/b2_hide_file`,
     fileInfoUrl: `${apiUrl}/b2_get_file_info`,
+    copyFileUrl: `${apiUrl}/b2_copy_file`,
     downloadAuthorizationUrl: `${apiUrl}/b2_get_download_authorization`,
     downloadFileByNameUrl: (bucketName, fileName) => `${b2._auth.downloadUrl}/file/${bucketName}/${fileName}`,
     downloadFileByIdUrl: (fileId) => `${b2._auth.downloadUrl}${conf.API_VERSION_URL}/b2_download_file_by_id?fileId=${fileId}`,
@@ -202,6 +203,7 @@ const actions = {
     startLargeFile: (b2, args) => post(b2, endpoints(b2).startLargeFileUrl, {
       bucketId: args.bucketId,
       fileName: args.fileName,
+      fileInfo: args.info,
       contentType: args.contentType || 'b2/x-auto'
     }),
 
@@ -255,6 +257,16 @@ const actions = {
       fileId: args.fileId
     }),
 
+    copyFile: (b2, args) => post(b2, endpoints(b2).copyFileUrl, {
+      sourceFileId: args.fileId,
+      fileName: args.fileName,
+      destinationBucketId: args.destinationBucketId, // optional, if not set, same bucket
+      range: args.range, // optional, if not set, the entire file
+      metadataDirective: args.info ? 'REPLACE' : 'COPY',
+      fileInfo: args.info,
+      contentType: args.contentType || 'application/octet-stream',
+    }),
+
     getDownloadAuthorization: (b2, args) => post(b2, endpoints(b2).downloadAuthorizationUrl, {
       bucketId: args.bucketId,
       fileNamePrefix: args.fileNamePrefix,
@@ -302,6 +314,7 @@ export class B2 {
   deleteFileVersion(args) { return actions.file.deleteFileVersion(this, Object.assign({}, this._ctx, args)); }
   cancelLargeFile(args) { return actions.file.cancelLargeFile(this, Object.assign({}, this._ctx, args)); }
   finishLargeFile(args) { return actions.file.finishLargeFile(this, Object.assign({}, this._ctx, args)); }
+  copyFile(args) { return actions.file.copyFile(this, Object.assign({}, this._ctx, args)); }
   listParts(args) { return actions.file.listParts(this, Object.assign({}, this._ctx, args)); }
   startLargeFile(args) { return actions.file.startLargeFile(this, Object.assign({}, this._ctx, args)); }
   getUploadPartUrl(args) { return actions.file.getUploadPartUrl(this, Object.assign({}, this._ctx, args)); }

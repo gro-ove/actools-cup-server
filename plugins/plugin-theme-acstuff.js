@@ -1,12 +1,15 @@
 /** A small extension for that acstuff look, extends themes plugin or just overrides the entire theme if themes plugin is not available. */
-import { Hooks, pluginSettings } from '../src/app';
+import { db, Hooks, pluginSettings } from '../src/app';
 import { prepareAsset } from '../src/std' with { type: 'macro' };
 
 // Link to the index page in header:
 const Settings = pluginSettings('acstuffTheme', { bgImage: null });
 if (!Settings.bgImage) throw new Error(`Plugin is not configured`);
 
-const headerLink = <a class="navbar-brand" href="/"><img src="/res/icon.png" />CUP</a>;
+const version = db.storage.get('cup-build');
+const headerLink = version
+  ? <a class="navbar-brand" href="/"><img src="/res/icon.png" />CUP <tag style="font-size:0.6em" title="Build version, automatically increments when CUPv2 gets an update">v{version}</tag></a>
+  : <a class="navbar-brand" href="/"><img src="/res/icon.png" />CUP</a>;
 Hooks.register('core.tpl.header', body => body.splice(0, 0, headerLink));
 
 Hooks.register('core.res.style.css', data => data.push(prepareAsset('css', `  
@@ -34,7 +37,7 @@ const themeFn = (final, $, user) => {
 }
 .background {
   position: fixed;
-  background: url( "BG" );
+  background: url("BG");
   background-size: cover;
   opacity: 0.35;
   height: 100%;
@@ -48,8 +51,8 @@ const themeFn = (final, $, user) => {
   top:0;left:0;right:0;height:32px;
   backdrop-filter: blur(10px);
 }
-.dropdown-content , .undo { 
-  backdrop-filter: blur ( 10px ); 
+.dropdown-content, .toast { 
+  backdrop-filter: blur(10px); 
 }
 header {
   background:none;

@@ -1,4 +1,4 @@
-import { Hooks, db, DBTbl, DisabledFlag, ContentUtils, pluginSettings } from '../src/app';
+import { Hooks, db, DBTbl, DisabledFlag, ContentUtils, pluginSettings, Utils } from '../src/app';
 import { Timer } from '../src/std';
 
 const hiddenReason = 'Update URL seems to not be working';
@@ -14,14 +14,21 @@ async function validateURL(url) {
     const type = ContentUtils.verifyURL(url);
     if (type === 0) return true;
     if (type === 2) url = `http://` + url;
-    if (Settings.verbose) console.log(`Validating URL: ${url}`);
+    if (Settings.verbose) echo`Validating URL: _${url}`;
     const r = await fetch(url);
-    if (Settings.verbose) console.log(`  Resulting code: ${r.status}`);
+    if (Settings.verbose) echo`  Resulting code: _${r.status}`;
     return r.status < 400 || r.status > 499;
   } catch (e) {
-    if (Settings.verbose) console.warn(`  Validating error: ${e}`)
-    return false;
+    if (Settings.verbose) echo`  Validating error: =${e}`;
   }
+  if (await Utils.offline()) {
+    echo`!  Service is offline? 😳`;
+    do {
+      await Bun.sleep(10e3);
+    } while (await Utils.offline());
+    return await validateURL(url);
+  }
+  return false;
 }
 
 let queue = null;
@@ -54,7 +61,7 @@ async function runValidation(url, refID) {
         validated.set(nextURL, stat ? 1 : 0);
       }
       if (!stat) {
-        console.log(`Broken URL detected: ${nextURL} (${nextRefID.join('/')})`);
+        echo`Broken URL detected: _${nextURL} (${nextRefID.join('/')})`;
         foundBroken(nextRefID, nextURL);
       }
       await Bun.sleep(Timer.ms(Settings.checkCooldown));

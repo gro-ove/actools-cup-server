@@ -1,15 +1,49 @@
 /** A standard library I prepared for myself to use with Bun.js servers. */
 import { Database, Statement } from 'bun:sqlite';
+import { EventEmitter } from 'node:events';
 
 /** Some useful extensions. */
-// @ts-ignore
+type EchoFn = (msg: string[], ...args: any[]) => EchoFn;
+type PluralFn = (msg: string[], ...args: any[]) => string;
+
+declare global {
+  interface Array<T> {
+    groupBy(callback: (item: T) => string): { [key: string]: T[] };
+    contains(item: T): boolean;
+    count(callback: (item: T) => boolean): number;
+    unique(): T[];
+  }
+
+  interface Number {
+    hasFlag(flag: number): boolean;
+    setFlag(flag: number, condition: boolean): number;
+  }
+
+  interface JSON {
+    tryParse<T extends any>(data: string | false | null, fallback: T): T;
+  }
+
+  const echo: EchoFn;
+  const plural: PluralFn;
+
+  // (?<!U)`/[^`]+/\$\{(?!encodeURIComponent)
+  const U: PluralFn;
+}
+
 Array.prototype.groupBy = function (c) { return this.reduce((rv, x) => { let k = c(x); (rv[k] = rv[k] || []).push(x); return rv; }, {}); };
-// @ts-ignore
 Array.prototype.contains = function (v) { for (let i = 0; i < this.length; i++) { if (this[i] === v) return true; } return false; };
-// @ts-ignore
-Array.prototype.unique = function () { return [...new Set(this)]; }
-// @ts-ignore
 Array.prototype.count = function (fn) { let r = 0; for (let i = 0; i < this.length; i++) { if (fn(this[i])) ++r; } return r; }
+Array.prototype.unique = function () { return [...new Set(this)]; };
+Number.prototype.hasFlag = function (f) { return (this & f) === f; };
+Number.prototype.setFlag = function (f, c) { return c ? (this | f) : (this & ~f); };
+
+JSON.tryParse = (x, fallback) => {
+  try {
+    return x ? JSON.parse(x) : null;
+  } catch (e) {
+    return fallback;
+  }
+};
 
 /** A primitive solution for ensuring tasks run one after another and not in parallel. */
 export class Busy {
@@ -53,28 +87,38 @@ export const fsExt = {
   }
 };
 
-/** Some extra niceties to deal with JavaScript. */
 let __installBusy: Busy | null = null;
+
+/** Some extra niceties to deal with JavaScript. */
 export const jsExt = {
   disposable(fn: Function) { return { [Symbol.dispose]: fn }; },
   raiseError(err: Error) { throw err; },
   tryCall<T, TErr>(fn: () => T, fnCatch: null | ((err: Error) => TErr) = null, fnFinally: null | Function = null): T | TErr | null { try { return fn(); } catch (e) { return fnCatch && fnCatch(e); } finally { fnFinally && fnFinally(); } },
   async tryCallAsync<T, TErr>(fn: () => T, fnCatch: null | ((err: Error) => TErr) = null, fnFinally: null | Function = null) { try { return await fn(); } catch (e) { return fnCatch && await fnCatch(e); } finally { fnFinally && fnFinally(); } },
 
-  /** Install a package in a lazy way and turn into a function using that package (currently, I can’t be bothered to deal with NPM and package.json) */
-  install<Ret, A extends unknown[] = []>(pkg: string, handler: (packageRef: any, ...args: A) => Ret): ((...args: A) => Ret) & { ready: () => boolean } {
-    let p = jsExt.tryCall(() => require(pkg), () => ((async () => {
-      if (!__installBusy) __installBusy = new Busy();
-      const w = await __installBusy.wait();
-      require('child_process').exec(`bun install --no-save ${pkg}`, (e: any) => {
-        console.log(`Module ${pkg} ${e ? 'failed to install' : 'installed'}`);
-        p = e ? '' + e : jsExt.tryCall(() => require(pkg), err => '' + (err?.message || err)) || 'Error';
-        w[Symbol.dispose]();
+  requireAsync(pkg: string) {
+    try {
+      return Promise.resolve(require(pkg));
+    } catch {
+      return new Promise(async (res, rej) => {
+        if (!__installBusy) __installBusy = new Busy();
+        const w = await __installBusy.wait();
+        require('child_process').exec(`bun install --no-save ${pkg}`, (e: any) => {
+          console.log(`Module ${pkg} ${e ? 'failed to install' : 'installed'}`);
+          jsExt.tryCall(() => res(require(pkg)), rej);
+          w[Symbol.dispose]();
+        });
       });
-    })(), null));
+    }
+  },
+
+  /** Install a package in a lazy way and turn into a function using that package (currently, I can’t be bothered to deal with NPM and package.json) */
+  withRequired<Ret, A extends unknown[] = []>(pkg: string, handler: (packageRef: any, ...args: A) => Ret): ((...args: A) => Ret) & { ready: () => boolean } {
+    let p: any, s = {};
+    jsExt.requireAsync(pkg).then(r => p = r, err => p = '' + err);
     return Object.assign((...args: A) => {
       if (!p || typeof p === 'string') throw new Error(p || 'Package is not ready');
-      return handler(p, ...args);
+      return handler.call(s, p, ...args);
     }, { ready() { return !!(p && typeof p !== 'string'); } });
   }
 };
@@ -82,8 +126,10 @@ export const jsExt = {
 export function prepareAsset(type: 'css' | 'js', data: string) {
   data = ('' + data).trim();
   if (type === 'css') {
-    return data.trim().replace(/\s+/g, ' ').replace(/(?<=[{}();:,]) |;(?=\})| (?=[{}();,])/g, '')
-      .replace(/\b(?:black|white)\b/, _ => _[0] === 'b' ? '#000' : '#fff');
+    return data.replace(/\s+/g, ' ');
+  }
+  if (type === 'js') {
+    return data.replace(/^\s*(?:\/\/.*|\/\*[\s\S]+?\*\/)/gm, '').replace(/\s*\n\s+/g, '\n');
   }
   return data;
 };
@@ -180,14 +226,26 @@ export const Timer = Object.assign(parseTimer, {
   timestamp: (shift: string | number) => Date.now() + parseTimer(shift),
   timeout: (delay: string | number, callback: Function) => ({ [Symbol.dispose]: clearTimeout.bind(null, setTimeout(callback, parseTimer(delay))) }),
   interval: (interval: string | number, callback: Function) => ({ [Symbol.dispose]: clearInterval.bind(null, setInterval(callback, parseTimer(interval))) }),
-  service: (interval: string | number, callback: () => Promise<any>) => {
-    let parsed = parseTimer(interval), timeout: Timer;
+  service: (interval: string | number, callback: () => Promise<any>, errorHandler: (err: Error | any) => void) => {
+    let parsed = parseTimer(interval), timeout: Timer | false;
     async function cb() {
-      let ret = jsExt.tryCallAsync(callback);
-      timeout = setTimeout(cb, (typeof ret === 'number' || typeof ret === 'string' ? parseTimer(ret) : 0) || parsed);
+      if (timeout === false) return;
+      timeout = null;
+      let ret = jsExt.tryCallAsync(callback, errorHandler);
+      if (timeout == null) timeout = setTimeout(cb, (typeof ret === 'number' || typeof ret === 'string' ? parseTimer(ret) : 0) || parsed);
     }
     timeout = setTimeout(cb, serviceDelay += 1e3);
-    return { [Symbol.dispose]: () => clearTimeout(timeout) };
+    return {
+      poke: (delay: string | number) => {
+        if (timeout === false) return;
+        if (timeout) clearTimeout(timeout);
+        timeout = setTimeout(cb, parseTimer(delay));
+      },
+      [Symbol.dispose]: () => {
+        if (timeout) clearTimeout(timeout);
+        timeout = false;
+      }
+    };
   },
 });
 
@@ -327,6 +385,7 @@ export class Router {
   on(group: string, path: string, callback: Function) {
     if (path[0] !== '/') throw new Error(`Incorrect path: ${group} ${path}`);
     const e = path.substring(1).split('/').reduce((p, s) => {
+      if (group === 'HEAD') console.log(s);
       if (!s || s === ':') return Object.assign(p, s && { param: '' });
       const k = s.startsWith(':') ? '' : s;
       return p.children[k] || (p.children[k] = ({ children: {}, param: s.startsWith(':') ? s.substring(1) : null, callback: null }));
@@ -338,19 +397,25 @@ export class Router {
   /** Usage: `.on('POST', '/url/with/leading/slash/paramValue/thisWill/Be/Available/As/Empty/String', {})` */
   get(group: string, path: string, params: Object) {
     let root = this.methods[group];
-    if (!root) return null;
-    for (let c = 1, i = 2; i <= path.length; ++i) {
+    if (!root) {
+      return null;
+    }
+    if (root.param === '') {
+      params[''] = Router.#normalize(path);
+      return root.callback;
+    }
+    for (let c = 1, i = 1; i <= path.length; ++i) {
       if (path[i] !== '/' && path[i]) continue;
       if (c === i) {
         ++c;
         continue;
       }
       const u = path.substring(c, i);
-      root = root.children[u] || root.children[''];
+      root = u ? root.children[u] || root.children[''] : root;
       if (!root) return null;
       if (root.param != null) {
         if (root.param === '') {
-          params[''] = path.substring(i + 1);
+          params[''] = Router.#normalize(path.substring(i + 1));
           return root.callback;
         }
         params[root.param] = decodeURIComponent(u);
@@ -358,6 +423,10 @@ export class Router {
       c = i + 1;
     }
     return root.callback;
+  }
+
+  static #normalize(path: string) {
+    return path.replace(/^\/+|(?<=\/)\/+|\/+$/g, '');
   }
 }
 
@@ -398,7 +467,7 @@ type DatabaseTableItem<T> = { [K in keyof T]: DatabaseRowDataType<T[K]> };
 type DatabaseTablePartialItem<T> = Partial<DatabaseTableItem<T>>;
 type DatabaseItemFiltered<T, K extends keyof T> = { [P in K]: DatabaseRowDataType<T[P]>; };
 type DatabaseTableFilter<T> = null | string | number | DatabaseTableItem<T>;
-type DatabaseTableFieldRef<T> = T | { field: T, operator: string, raw: string };
+type DatabaseTableFieldRef<T> = T | { raw: string } | { field: T, operator: string };
 
 /** 
  * Simple helper for quickly setting up a database for an app, with some extensions for local storage storing JSONable data and 
@@ -431,19 +500,21 @@ PRAGMA page_size = 8192;
 CREATE TABLE IF NOT EXISTS __sto (key TEXT PRIMARY KEY, value TEXT);`);
 
     this.storage = new LazyMap(k => JSON.parse(this.#queryRaw(`SELECT value FROM __sto WHERE key=?1`).get(k)?.value || 'null'),
-      (k, v) => this.query(`INSERT INTO __sto (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value=?2 WHERE value IS NOT ?2`).run(k, v && JSON.stringify(v)).changes !== 0);
+      (k, v) => (v == null
+        ? this.query(`DELETE FROM __sto WHERE key=?1`).run(k)
+        : this.query(`INSERT INTO __sto (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value=?2 WHERE value IS NOT ?2`).run(k, v && JSON.stringify(v))).changes !== 0);
 
     if (params && params.debug) {
-      this.query = ((b: Function, q: string) => { console.log(`DB QUERY: ${filename}, ${q}`); return b.call(this, q); }).bind(null, this.query);
-      this.prepare = ((b: Function, q: string) => { console.log(`DB PREPARE: ${filename}, ${q}`); return b.call(this, q); }).bind(null, this.prepare);
-      this.exec = ((b: Function, q: string) => { console.log(`DB EXEC: ${filename}, ${q}`); return b.call(this, q); }).bind(null, this.exec);
+      this.query = ((b: Function, q: string) => { console.log(`DB.query: ${filename}, ${q}`); return b.call(this, q); }).bind(null, this.query);
+      this.prepare = ((b: Function, q: string) => { console.log(`DB.prepare: ${filename}, ${q}`); return b.call(this, q); }).bind(null, this.prepare);
+      this.exec = ((b: Function, q: string) => { console.log(`DB.exec: ${filename}, ${q}`); return b.call(this, q); }).bind(null, this.exec);
     }
 
     this.#cache.queryTransation = this.prepare('BEGIN TRANSACTION');
     this.#cache.queryCommit = this.prepare('COMMIT');
   }
 
-  #queryRaw(query): any { return this.query(query); }
+  #queryRaw(query: string): any { return this.query(query); }
 
   /**
    * A thing for basic typed key-value storage. Pass `{}` as `dataRow` to store any JSON-able data. If created with `caching`, values
@@ -520,28 +591,33 @@ CREATE TABLE IF NOT EXISTS __sto (key TEXT PRIMARY KEY, value TEXT);`);
     return fn.bind(null, this.prepare(query));
   }
 
-  static #Table = class <T extends Record<string, DatabaseRow<any>>> {
+  static #Table = class <T extends Record<string, DatabaseRow<any>>> extends EventEmitter {
     db: ExtendedDatabase;
     name: string;
     primaryKey: string;
     orderBase: string[];
+    #updated = false;
 
-    constructor(db: ExtendedDatabase, name: string, rows: T, props: ({ order: string | null, indices: { columns: string[], unique: boolean | null }[], upgrade: ((old: T) => T)[] | null, version: number | null } | null) = null) {
+    constructor(db: ExtendedDatabase, name: string, rows: T, props: ({ order: string | null, indices: { columns: string[], unique: boolean | null }[], upgrade: ((old: T) => T)[] | null, version: number | null, temporary: boolean | null } | null) = null) {
+      super();
       this.db = db;
       this.name = name;
 
       const targetVer = (props?.upgrade?.length || 0) + (props?.version || 0) * 8192;
-      const curVer = +db.#queryRaw(`SELECT value FROM __sto WHERE key=?1`).get(name)?.value;
+      const curVer = props?.temporary ? Number.NaN : +db.#queryRaw(`SELECT value FROM __sto WHERE key=?1`).get(name)?.value;
       if (curVer !== targetVer) {
+        if (props?.temporary) {
+          db.exec(`DROP TABLE IF EXISTS ${name};`);
+        }
         db.transaction(() => {
           let finalize: Function | null = null;
           if (!Number.isNaN(curVer)) {
-            if (curVer > targetVer) throw new Error('Version rollback is not supported');
             console.log(`Table ${name} is upgrading from v${curVer} to v${targetVer}`);
             if ((targetVer / 8192 | 0) === (curVer / 8192 | 0) && props?.upgrade != null) {
+              if (curVer > targetVer) throw new Error('Version rollback is not supported');
               finalize = ((oldEntries: any[], route: Function[]) => {
                 const insert = db.prepare(`INSERT INTO ${name} (${Object.keys(rows)}) VALUES (${Object.keys(rows).map(x => `$${x}`)})`);
-                oldEntries.map(x => route.reduce((p, c) => p = c(p), x)).forEach(x => x && db.#queryRaw(insert).run(x));
+                oldEntries.map(x => route.reduce((p, c) => p = c(p), x)).forEach(x => x && insert.run(x));
               }).bind(null, db.#queryRaw(`SELECT * FROM ${name}`).all(), props.upgrade.slice(curVer % 8192));
             }
             db.exec(`DROP TABLE ${name};`);
@@ -561,6 +637,7 @@ CREATE TABLE IF NOT EXISTS __sto (key TEXT PRIMARY KEY, value TEXT);`);
     toString() { return this.name }
 
     get<K extends keyof T>(key: DatabaseTableFilter<T>, rows: null | K[] = null): DatabaseItemFiltered<T, K> | null {
+      if (typeof key === 'object' && key && key[this.primaryKey]) return this.get(key[this.primaryKey]);
       return this.db.#queryRaw(`SELECT ${rows?.join(',') || '*'} FROM ${this.name}${this.#buildFilter(key)}`).get(key);
     }
 
@@ -578,7 +655,6 @@ CREATE TABLE IF NOT EXISTS __sto (key TEXT PRIMARY KEY, value TEXT);`);
     pall<K extends keyof T, R extends keyof T>(rows: null | R[], filter: DatabaseTableFieldRef<K>): (value: DatabaseRowDataType<T[K]>) => DatabaseItemFiltered<T, R>[];
     pall<K extends keyof T, R extends keyof T>(rows: null | R[], filter: DatabaseTableFieldRef<K>[]): (filter: DatabaseItemFiltered<T, K>) => DatabaseItemFiltered<T, R>[];
     pall<K extends keyof T, R extends keyof T>(rows: null | R[] = null, filter: DatabaseTableFieldRef<K> | DatabaseTableFieldRef<K>[]): (filter: any) => DatabaseItemFiltered<T, R>[] {
-      console.log(`return this.all(${this.#prepareAccess(filter)})`);
       return new Function('f', `return this.all(${this.#prepareAccess(filter)})`)
         .bind(this.db.prepare(`SELECT ${rows?.join(',') || '*'} FROM ${this.name}${this.#prepareFilter(filter)}`));
     }
@@ -605,19 +681,54 @@ CREATE TABLE IF NOT EXISTS __sto (key TEXT PRIMARY KEY, value TEXT);`);
         .bind(this.db.prepare(`SELECT COUNT(*) AS c FROM ${this.name}${this.#prepareFilter(filter)}`));
     }
 
+    #ran<K extends { changes: number, lastInsertRowid: number | bigint }>(response: K): K {
+      if (response.changes > 0 && !this.#updated) {
+        this.#updated = true;
+        process.nextTick(() => {
+          this.emit('update');
+          this.#updated = false;
+        });
+      }
+      return response;
+    }
+
+    editQuery(query: string, ...args: any[]): { changes: number, lastInsertRowid: number | bigint } {
+      return this.#ran(this.db.#queryRaw(query).run(...args));
+    }
+
+    editPrepare(query: string) {
+      let s = this.db.prepare(query);
+      return { run: (...args: any) => this.#ran(s.run(...args)) };
+    }
+
+    clear(): number {
+      return this.editQuery(`DELETE FROM ${this.name}`).changes;
+    }
+
     delete(filter: DatabaseTableFilter<T>): number {
-      return this.db.#queryRaw(`DELETE FROM ${this.name}${this.#buildFilter(filter)}`).run(filter).changes;
+      if (!filter) throw new Error(`Filter is required`);
+      return this.editQuery(`DELETE FROM ${this.name}${this.#buildFilter(filter)}`, filter).changes;
     }
 
     pdelete<K extends keyof T>(filter: DatabaseTableFieldRef<K>): (value: DatabaseRowDataType<T[K]>) => number;
     pdelete<K extends keyof T>(filter: DatabaseTableFieldRef<K>[]): (filter: DatabaseItemFiltered<T, K>) => number;
     pdelete<K extends keyof T>(filter: DatabaseTableFieldRef<K> | DatabaseTableFieldRef<K>[]): (filter: any) => number {
+      if (!filter) throw new Error(`Filter is required`);
       return new Function('f', `return this.run(${this.#prepareAccess(filter)}).changes`)
-        .bind(this.db.prepare(`DELETE FROM ${this.name}${this.#prepareFilter(filter)}`));
+        .bind(this.editPrepare(`DELETE FROM ${this.name}${this.#prepareFilter(filter)}`));
     }
 
-    update(filter: DatabaseTableFilter<T>, changes: DatabaseTablePartialItem<T>): number {
-      return this.db.#queryRaw(`UPDATE ${this.name} SET ${Object.keys(changes).map(x => `${x}=$${x}`)}${this.#buildFilter(filter, '__f_')}`).run(filter ? Object.assign(Object.entries(filter).reduce((p, [k, v]) => ((p[`__f_${k}`] = v), p), {}), changes) : changes).changes;
+    update(filter: DatabaseTableFilter<T>, changes: Partial<{ [K in keyof T]: DatabaseRowDataType<T[K]> | { mask: number, value: number } }>): number {
+      let p = typeof filter === 'object' ? Object.assign({}, filter) : Object.assign({ [this.primaryKey]: filter });
+      let u = this.#buildFilter(p);
+      return this.editQuery(`UPDATE ${this.name} SET ${Object.entries(changes).map(([k, v]) => {
+        if (v && typeof v === 'object' && v.mask) {
+          p[`__u_${k}`] = v.value === true ? v.mask : v.value || 0;
+          return `${k}=((${k} & ~${v.mask}) | $__u_${k})`;
+        }
+        p[`__u_${k}`] = v;
+        return `${k}=$__u_${k}`;
+      })}${u}`, p).changes;
     }
 
     pupdate<K extends keyof T, C extends keyof T>(filter: K, changes: C): (filter: DatabaseRowDataType<T[K]>, changes: DatabaseRowDataType<T[C]>) => number;
@@ -630,11 +741,11 @@ CREATE TABLE IF NOT EXISTS __sto (key TEXT PRIMARY KEY, value TEXT);`);
     pupdate<K extends keyof T, C extends keyof T>(filter: K[], changes: C[], consts: DatabaseTablePartialItem<T>): (filter: DatabaseItemFiltered<T, K>, changes: DatabaseItemFiltered<T, C>) => number;
     pupdate<K extends keyof T, C extends keyof T>(filter: K | K[], changes: C | C[], consts: DatabaseTablePartialItem<T> | undefined = undefined): (filter: any, changes: any) => number {
       const b = Array.isArray(changes) ? changes : changes ? [changes] : [];
-      const p = this.db.prepare(`UPDATE ${this.name} SET ${[
+      const p = this.editPrepare(`UPDATE ${this.name} SET ${[
         b.map((x, i) => `${x.toString()}=?${i + 1}`),
         consts ? Object.entries(consts).map(([k, v]) => `${k}=${v && v.sqlite || v}`) : []
       ].flat(1)}${this.#prepareFilter(filter, b.length)}`);
-      return new Function('f', 'c', `return this.run(${[Array.isArray(changes) ? changes.map(x => `c[${JSON.stringify(x)}]`) : 'c', this.#prepareAccess(filter)].flat(1)}).changes`).bind(p);
+      return new Function('v', 'f', 'c', `return this.run(${[Array.isArray(changes) ? changes.map(x => `v(c[${JSON.stringify(x)}])`) : 'v(c)', this.#prepareAccess(filter)].flat(1)}).changes`).bind(p, this.#extractValue);
     }
 
     insert(entry: DatabaseTablePartialItem<T> | DatabaseTablePartialItem<T>[]): number {
@@ -645,15 +756,30 @@ CREATE TABLE IF NOT EXISTS __sto (key TEXT PRIMARY KEY, value TEXT);`);
         return ret;
       }
       // @ts-ignore
-      return Number(this.db.query(`INSERT INTO ${this.name} (${Object.keys(entry)}) VALUES (${Object.keys(entry).map(x => `$${x}`)})`).run(entry).lastInsertRowid);
+      const is = [], ks = [], vs = [];
+      for (const [k, v] of Object.entries(entry)) {
+        is.push(k);
+        ks.push(`?${vs.length + 1}`);
+        vs.push(this.#extractValue(v));
+      }
+      return Number(this.editQuery(`INSERT INTO ${this.name} (${is}) VALUES (${ks})`, ...vs).lastInsertRowid);
     }
 
     pinsert<K extends keyof T>(rows: K[], consts: DatabaseTablePartialItem<T> | undefined = undefined): (value: DatabaseItemFiltered<T, K> | DatabaseItemFiltered<T, K>[]) => number {
-      return new Function('d', 'f', `
-        if (!Array.isArray(f)) return this.run(${rows.map(x => `f[${JSON.stringify(x)}]`)}).lastInsertRowid;
+      return new Function('d', 'v', 'f', `
+        if (!Array.isArray(f)) return this.run(${rows.map(x => `v(f[${JSON.stringify(x)}])`)}).lastInsertRowid;
         if (!f.length) return null;
         const _ = d.write().start();
-        try { let u = 0; for (const e of f) u = this.run(${rows.map(x => `e[${JSON.stringify(x)}]`)}).lastInsertRowid; return u; } finally { _[Symbol.dispose](); }`).bind(this.db.prepare(`INSERT INTO ${this.name} (${[rows, consts ? Object.keys(consts) : []].flat(1)}) VALUES (${[rows.map((_, i) => `?${i + 1}`), consts ? Object.values(consts).map(x => x && x.sqlite || x) : []].flat(1)})`), this.db);
+        try { let u = 0; for (const e of f) u = this.run(${rows.map(x => `v(e[${JSON.stringify(x)}])`)}).lastInsertRowid; return u; } finally { _[Symbol.dispose](); }`).bind(this.editPrepare(`INSERT INTO ${this.name} (${[rows, consts ? Object.keys(consts) : []].flat(1)}) VALUES (${[rows.map((_, i) => `?${i + 1}`), consts ? Object.values(consts).map(x => x && x.sqlite || x) : []].flat(1)})`), this.db, this.#extractValue);
+    }
+
+    #extractValue(v: DatabaseRowType | { callback: () => DatabaseRowType }) {
+      return v && typeof v === 'object' && typeof v.callback === 'function' ? v.callback() : v;
+    }
+
+    gc<K extends keyof T>(column: K, maxAge: number | string) {
+      const q = this.pdelete({ raw: `${column.toString()} < (${this.db.value.now.sqlite} - ${Timer.seconds(maxAge)})` });
+      setInterval(q, Timer.parse(maxAge) * 0.2);
     }
 
     order(p = ''): string {
@@ -664,10 +790,15 @@ CREATE TABLE IF NOT EXISTS __sto (key TEXT PRIMARY KEY, value TEXT);`);
       return Object.assign(this, fn.call(this, this));
     }
 
-    #buildFilter(filter: DatabaseTableFilter<T>, prefix: string = '') {
+    #buildFilter(filter: DatabaseTableFilter<T>) {
       if (filter != null && typeof filter !== 'object') return ` WHERE ${this.primaryKey}=?1`;
       let r = '';
-      if (typeof filter === 'object') for (const key in filter) r += r ? ` AND ${key}=$${key}` : ` WHERE ${key}=$${prefix}${key}`;
+      if (typeof filter === 'object') {
+        for (const key in filter) {
+          if (filter[key] == null) r += r ? ` AND ${key} IS NULL` : ` WHERE ${key} IS NULL`;
+          else r += r ? ` AND ${key}=$${key}` : ` WHERE ${key}=$${key}`;
+        }
+      }
       return r;
     }
 
@@ -687,13 +818,24 @@ CREATE TABLE IF NOT EXISTS __sto (key TEXT PRIMARY KEY, value TEXT);`);
     }
   };
 
+  // TODO: REMOVE
+  bits(...args: any[]) {
+    let m = 0, r = { assign: '', value: 0, callback() { return this.value; } };
+    for (var i = 0; i < args.length; i += 2) {
+      m |= args[i];
+      r.value += args[i + 1];
+    }
+    r.assign = `K=((K&~${m})|V)`;
+    return r;
+  }
+
   /**
    * A constuctor for tables giving a somewhat type-aware result. Main advantage however is simple versioning.
    * 
    * To upgrade a table, simply add a function to update[] taking a row in an old format and returning a row in a new format. Number of
    * upgrade functions defines table version. If table version is 2, but third function is added, only third one will be called.
    */
-  table<T extends Record<string, DatabaseRow<any>>, TExtended extends {}>(name: string, rows: T, props: (null | { order: string | null, indices: { columns: string[], unique: boolean | null }[], upgrade: ((old: T) => T)[] | null, version: number | null }) = null) {
+  table<T extends Record<string, DatabaseRow<any>>>(name: string, rows: T, props: (null | { order: string | null, indices: { columns: string[], unique: boolean | null }[], upgrade: ((old: T) => T)[] | null, version: number | null, temporary: boolean | null }) = null) {
     return new ExtendedDatabase.#Table(this, name, rows, props);
   }
 
@@ -702,18 +844,39 @@ CREATE TABLE IF NOT EXISTS __sto (key TEXT PRIMARY KEY, value TEXT);`);
   }
 }
 
+type CookieParams = { age: number | string, path: string, domain: string, httpOnly: boolean, secure: boolean };
+
 /** 
  * A fun addition to save and load pretty much any value as a cookie, includes a basic integrity verification as well.
  * As long as you don’t want to read cookies on the client-side.
  */
 export class CookieHandler {
-  static encoder = new NumberEncoder('!#$%&\'()*+-./:<=>?@[]^_`{|}~0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz');
+  static defaults: CookieParams | null = null;
+  static #encoder = new NumberEncoder('!#$%&\'()*+-./:<=>?@[]^_`{|}~0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz');
 
   req: Request;
   cookies: string[] = [];
 
   constructor(req: Request) {
     this.req = req;
+  }
+
+  static decode(cookie: string, start: number = 0, end: number = Infinity) {
+    end = cookie ? (end < 0 || end > cookie.length ? cookie.length : end) : -Infinity;
+    if (end - start <= 2) return null;
+    const f = CookieHandler.#encoder.decode(cookie, start, start + 2);
+    let r = cookie.substring(start + 2, end);
+    if (Number(BigInt(Bun.hash(r)) & 0x1f98n) !== (f & 0x1f98)) return null;
+    if (f & 6) r = (f & 2 ? Buffer.from(Bun.inflateSync(f & 4 ? Buffer.from(r, 'base64url') : r)) : Buffer.from(r, 'base64url')).toString('utf8');
+    return (f & 1) ? JSON.parse(r) : r;
+  }
+
+  static encode(value: any) {
+    let f = 0;
+    if (typeof value !== 'string') { if (value == null) return ''; f |= 1; value = JSON.stringify(value); }
+    if (value.length > 30) { const c = Bun.deflateSync(value); if (c.length < value.length) { f |= 2; value = c; } }
+    if ((f & 2) || /[^\w!#$%&'()*+./:<=>?@[\]^_`{|}~-]/.test(value)) { f |= 4; value = Buffer.from(value).toString('base64url'); }
+    return `${CookieHandler.#encoder.encode(Number(BigInt(Bun.hash(value)) & 0x1f98n) | f).padStart(2, CookieHandler.#encoder.key[0])}${value}`;
   }
 
   get(key: string): null | any {
@@ -723,33 +886,25 @@ export class CookieHandler {
       if (u === -1) return null;
       if (cookie[u + key.length] === '=' && (u === 0 || cookie[u - 1] === ' ' || cookie[u - 1] === ';')) {
         const s = u + key.length + 1;
-        let e = cookie.indexOf(';', s);
-        if (e === -1) e = cookie.length;
-        const f = CookieHandler.encoder.decode(cookie, s, s + 2);
-        let r = cookie.substring(s + 2, e);
-        if (Number(BigInt(Bun.hash(r)) & 0x1f98n) !== (f & 0x1f98)) return null;
-        if (f & 6) r = (f & 2 ? Buffer.from(Bun.inflateSync(f & 4 ? Buffer.from(r, 'base64url') : r)) : Buffer.from(r, 'base64url')).toString('utf8');
-        return (f & 1) ? JSON.parse(r) : r;
+        return CookieHandler.decode(cookie, s, cookie.indexOf(';', s));
       }
     }
     return null;
   }
 
-  set(key: string, value: null | any, params: { age: number | string, path: string, httpOnly: boolean, secure: boolean }) {
-    if (value == null) return this.delete(key);
-    let f = 0;
-    if (typeof value !== 'string') { f |= 1; value = JSON.stringify(value); }
-    if (value.length > 30) { const c = Bun.deflateSync(value); if (c.length < value.length) { f |= 2; value = c; } }
-    if ((f & 2) || /[^\w!#$%&'()*+./:<=>?@[\]^_`{|}~-]/.test(value)) { f |= 4; value = Buffer.from(value).toString('base64url'); }
+  set(key: string, value: null | any, params: CookieParams | null = null) {
+    if (CookieHandler.defaults) params = Object.assign({}, CookieHandler.defaults, params);
     this.cookies.push([
-      `${key}=${CookieHandler.encoder.encode(Number(BigInt(Bun.hash(value)) & 0x1f98n) | f).padStart(2, CookieHandler.encoder.key[0])}${value}; Path=${params?.path || '/'}`,
-      params?.age && `Max-Age=${Timer.seconds(params.age).toFixed(0)}`,
+      `${key}=${CookieHandler.encode(value)}; Path=${params?.path || '/'}`,
+      value == null ? `Max-Age=0` : params?.age && `Max-Age=${Timer.seconds(params.age).toFixed(0)}`,
+      params?.domain && `Domain=${params?.domain}`,
       params?.httpOnly && `HttpOnly`,
       params?.secure && `Secure`,
     ].filter(Boolean).join(';'));
   }
 
-  delete(key: string) {
+  delete(key: string, params: CookieParams | null = null) {
+    this.set(key, null, params);
     this.cookies.push(`${key}=; Max-Age=0; Path=/`);
   }
 
@@ -777,7 +932,7 @@ export class BunJSX {
   static configure(params: null | { jsxFactoryName: string, reactName: string, groupTagName: string, allowEmptyTag: boolean, attributeHandlers: {} } = null) {
     params = Object.assign({ allowEmptyTag: true, groupTagName: 'G', jsxFactoryName: 'JsxFactory', reactName: 'React' }, params);
     const html = (v: string | number | boolean | object) => typeof v === 'number' ? '' + v : Bun.escapeHTML(v);
-    const voidTags = { img: true, input: true, button: true, br: true, hr: true };
+    const voidTags = { img: true, input: true, button: true, br: true, hr: true, meta: true };
     const emptyObj = {};
     type Solvable = string | BunJSX | Solvable[];
 
@@ -886,3 +1041,112 @@ export class BunJSX {
     };
   }
 }
+
+
+const styles = {
+  '!': '\x1b[31m\x1b[1m\x1b[4m',
+  '+': '\x1b[32m\x1b[1m',
+  '^': '\x1b[1m\x1b[4m',
+  '*': '\x1b[36m\x1b[1m',
+  '_': '\x1b[4m',
+  '#': '\x1b[41m',
+  '.': '\x1b[90m',
+  reset: '\x1b[0m',
+};
+
+{
+  const argv = process.argv || [], env = process.env;
+  const isColorSupported = !('NO_COLOR' in env || argv.includes('--no-color')) && ('FORCE_COLOR' in env ||
+    argv.includes('--color') || process.platform === 'win32' || (require != null && require('tty').isatty(1) && env.TERM !== 'dumb') || 'CI' in env);
+  if (!isColorSupported) for (var n in styles) styles[n] = '';
+}
+
+/** 
+ * A replacement for `console.log()` for colored output. Use as a formatter:
+ * ```
+ * echo `^My fancy message: ${someValue}`;
+ * ```
+ * 
+ * Tags can be added at the start or in front of interpolated values:
+ * ```
+ * echo `When adding *${myID}, error occured: !${errorMessage}`;
+ * ```
+ * 
+ * Known tags:
+ * - `!`: warning, something bad;
+ * - `#`: failure, something horrible;
+ * - `+`: something good;
+ * - `^`: something important;
+ * - `*`: generic ID;
+ * - `.`: something not that important;
+ * - `_`: just an underscore.
+ * 
+ * Add `=` in front of interpolated value to output it using `console.log()` formatting instead.
+ */
+export function echo(msg: string, ...opts: any[]) {
+  if (!Array.isArray(msg)) return console.log(msg);
+  let y = styles[msg[0][0]];
+  let s = y || '';
+  let args = [];
+  for (let i = 0; i < msg.length - 1; ++i) {
+    let m = i === 0 && (y != null || msg[0][0] === ' ') ? msg[0].substring(1) : msg[i];
+    if (m.endsWith('=')) {
+      s += m.substring(0, m.length - 1);
+      if (s.endsWith('\n') || opts[i] instanceof Error) {
+        console.log(...args, s.replace(/[\n\s]+$/, '') + (y ? styles.reset : ''));
+        args = [opts[i]];
+      } else {
+        args.push(s.replace(/ $/, '') + (y != null ? styles.reset : ''));
+        args.push(opts[i]);
+      }
+      s = y || '';
+    } else {
+      let o = styles[m[m.length - 1]];
+      s += o != null ? m.substring(0, m.length - 1) : m;
+      if (o) s += o !== styles._ && o !== styles['*'] && y ? styles.reset + o : o;
+      s += opts[i];
+      if (o) s += styles.reset + (y || '');
+    }
+  }
+  s += msg.length === 1 && y ? msg[msg.length - 1].substring(1) : msg[msg.length - 1];
+  if (y) s += styles.reset;
+  console.log(...args, s);
+  return echo;
+}
+
+export function plural(msg: string[], ...opts: any[]) {
+  let r = '';
+  for (let i = 0; i < msg.length; ++i) {
+    if (i > 0) r += opts[i - 1];
+    r += msg[i].replace(/{(?:(\d+):)?([^}]+)}/g, (_, j, v) => plural.pluralize(opts[j || i - 1], v));
+  }
+  return r;
+}
+
+/** Usage: plural`${1} {cat}, ${5} {dog}, ${0} {entry}, ${6} {3:rush} ${4} {child(ren)} ${4} {human/people}` (if ID is not specified, previous number will be used) */
+plural.pluralize = (n: number, s: string) => {
+  const l = s[s.length - 1];
+  if (l === ')') return /^(.+)\((.+)\)$/.test(s) ? n == 1 ? RegExp.$1 : RegExp.$1 + RegExp.$2 : s;
+  let i = s.indexOf('/');
+  if (i !== -1) return n == 1 ? s.substring(0, i) : s.substring(i + 1);
+  if (n == 1) return s;
+  if (l === 'y') return s.substring(0, s.length - 1) + 'ies';
+  if (l === 's' || l === 'x' || l === 'h' && (s[s.length - 2] === 'c' || s[s.length - 2] === 's' )) return s + 'es';
+  return s + 's';
+}
+
+export function U(msg: string[], ...opts: any[]) {
+  let r = '';
+  for (let i = 0; i < msg.length; ++i) {
+    if (i > 0) r += encodeURIComponent(opts[i - 1]);
+    r += msg[i];
+  }
+  return r;
+}
+
+// @ts-ignore
+global.echo = echo;
+// @ts-ignore
+global.plural = plural;
+// @ts-ignore
+global.U = U;

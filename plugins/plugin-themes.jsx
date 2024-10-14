@@ -4,7 +4,7 @@ const mpUserTheme = db.map('p_userSettings_theme', db.row.integer(), db.row.text
 
 let themes = {
   'auto': { name: 'System' },
-  'light': { name: 'Light', css: `:root{--bg:#fff;--input-bg:#eee;--accent-warn:#b00;--accent-good:#080;--text-color:#000;--link:#008;--separator:#0008;--table-odd:#7771}` },
+  'light': { name: 'Light', css: `:root{--bg:#fff;--input-bg:#eee;--accent-warn:#b00;--accent-good:#080;--text-color:#000;--link:#008;--separator:#0008;--table-odd:#7774}` },
   'dark': { name: 'Dark', css: `:root{--bg:#111;--input-bg:#222;--text-color:#fff;--accent-warn:#f77;--accent-good:#7f7;--link:#7af;--separator:#fff8}` },
 };
 let defaultTheme = themes.auto;

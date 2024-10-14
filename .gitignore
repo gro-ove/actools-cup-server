@@ -185,3 +185,6 @@ dump.js
 res/cdn
 run.bat
 todo.txt
+.dev
+.dump.js
+*.zip

@@ -1,12 +1,21 @@
 // @include:libs/sha1.min.js
 
+const domain = window.B2Upload && window.B2Upload.domain || '';
+const baseHeaders = window.B2Upload && { 'X-B2-Token': window.B2Upload.token } || {};
+
 async function processMessages() {
   return new Promise(setTimeout);
 }
 
+function isArchiveHeader(v) {
+  return v === 0x504b0304 || v === 0x504B0506 /* zip */
+    || v === 0x52457E5E || v === 0x52617221 /* rar */
+    || v === 0x377ABCAF /* 7z */;
+}
+
 function isZip(data) {
   const dataView = new DataView(data);
-  return dataView.byteLength > 4 && dataView.getUint32(0) === 0x504b0304;
+  return dataView.byteLength > 4 && isArchiveHeader(dataView.getUint32(0));
 }
 
 function loadFileChecksum(file, progressListener) {
@@ -15,7 +24,7 @@ function loadFileChecksum(file, progressListener) {
     reader.onerror = reject;
     reader.onload = async function () {
       if (!isZip(this.result)) {
-        reject('Please use ZIP archive to ensure reliable content scanning and installation');
+        reject('Please use ZIP, RAR or 7-Zip archive to ensure reliable content scanning and installation');
         return;
       }
       // this.result.
@@ -64,6 +73,8 @@ function progressDialog(title) {
     error(message) {
       console.log(message);
       dialog.querySelector('button').textContent = 'Close';
+      message = ('' + message).trim();
+      if (!/[\.!?]$/.test(message)) message += '.';
       this.report({ message, progress: 1 }).cancellable(() => { });
     },
     done() {
@@ -73,36 +84,65 @@ function progressDialog(title) {
 }
 progressDialog.any = () => document.querySelector('modal-popup') != null;
 
+function formatSize(size, digits = 1) {
+  const f = (n, d) => n.toFixed(n < 20 ? d : n < 200 && d === 2 ? 1 : 0);
+  if (size < 0.9 * 1024) return `${size} B`;
+  if (size < 0.9 * 1024 * 1024) return `${f(size / 1024, digits)} KB`;
+  if (size < 0.9 * 1024 * 1024 * 1024) return `${f(size / (1024 * 1024), digits)} MB`;
+  return `${f(size / (1024 * 1024 * 1024), digits)} GB`;
+}
+
+function formatSizeRange(size, digits = 1) {
+  const f = (n, d) => n.toFixed(n < 20 ? d : n < 200 && d === 2 ? 1 : 0);
+  if (size[1] < 0.9 * 1024) return `${size[0]}/${size[1]} B`;
+  if (size[1] < 0.9 * 1024 * 1024) return `${f(size[0] / 1024, digits)}/${f(size[1] / 1024, digits)} KB`;
+  if (size[1] < 0.9 * 1024 * 1024 * 1024) return `${f(size[0] / (1024 * 1024), digits)}/${f(size[1] / (1024 * 1024), digits)} MB`;
+  return `${f(size[0] / (1024 * 1024 * 1024), digits)}/${f(size[1] / (1024 * 1024 * 1024), digits)} GB`;
+}
+
+function formatTime(seconds) {
+  const days = seconds / (24 * 60 * 60);
+  if (days >= 356) return `${(days / 356).toFixed(1)} y`;
+  if (days >= 2) return `${(days).toFixed(0)} d`;
+  if (days >= 2 / 24) return `${(days * 24).toFixed(0)} h`;
+  if (days >= 2 / (24 * 60)) return `${(days * (24 * 60)).toFixed(0)} min`;
+  return `${(days * (24 * 60 * 60)).toFixed(0)} s`;
+}
+
 let cooldown = 0;
 async function updateB2Status(target) {
   const url = target.value;
   const attr = target.getAttribute('data-b2-done');
   if (attr === url) return;
   if (attr) target.removeAttribute('data-b2-done');
-  if (/^cup:\/\/b2\/.+/.test(url)) {
-    const res = await fetch(`/api/plugin-b2/file/${encodeURIComponent(url)}`);
+  if (/^cup:\/\/b2\/(.+)/.test(url)) {
+    target.parentNode.previousSibling.classList.toggle('b2-anim', false);
+    const key = RegExp.$1;
+    const res = await fetch(`${domain}/api/plugin-b2/file/${encodeURIComponent(url)}`, { headers: baseHeaders });
     if (res.status === 404) {
-      target.parentNode.setAttribute('data-input-result', '❌ Unknown URL');
+      setInputResult(target, '❌ Unknown URL');
       target.setAttribute('data-b2-done', url);
     } else if (res.status !== 200) {
-      target.parentNode.setAttribute('data-input-result', '❌ Failed to check the state');
+      setInputResult(target, '❌ Failed to check the state');
     } else {
       const state = await res.json();
       if (state.name) {
+        const n = `<a href="/manage/file/b2/${key}">${escapeHTML(state.name)}</a>`;
         if (state.status === 'ready') {
           target.setAttribute('data-b2-done', url);
-          target.parentNode.setAttribute('data-input-result', `🆗 ${state.name} (${(state.size / (1024 * 1024)).toFixed(0)} MB)`);
+          setInputResult(target, `🆗 ${n} (${formatSize(state.size, 0)})`, null, true);
         } else if (state.status === 'limbo') {
-          target.parentNode.setAttribute('data-input-result', `🔜 ${state.name} (${(state.size / (1024 * 1024)).toFixed(0)} MB), ready for processing`);
+          setInputResult(target, `🔜 ${n} (${formatSize(state.size, 0)}), ready for processing`);
         } else {
-          target.parentNode.setAttribute('data-input-result', `🔝 ${state.name} (${(state.size / (1024 * 1024)).toFixed(0)} MB), ${state.status}`);
+          setInputResult(target, `🔝 ${n} (${formatSize(state.size, 0)}), ${state.status}`);
         }
       } else {
-        target.parentNode.setAttribute('data-input-result', '❌ Failed to verify file state');
+        setInputResult(target, '❌ Failed to verify file state');
       }
     }
   } else {
-    target.parentNode.removeAttribute('data-input-result');
+    target.parentNode.previousSibling.classList.toggle('b2-anim', true);
+    setInputResult(target, null);
   }
 }
 
@@ -166,7 +206,7 @@ function progressCompute(totalSize, prefix) {
       const speed = loaded / ((Date.now() - start) / 1e3);
       const timeLeft = (totalSize - loaded) / speed;
       return {
-        message: `${prefix || ''}${(loaded / (1024 * 1024)).toFixed(1)}/${(totalSize / (1024 * 1024)).toFixed(1)} MB, ${(speed / (1024 * 1024)).toFixed(2)} MB/s, ETA: ${timeLeft.toFixed(0)} s`,
+        message: `${prefix || ''}${formatSizeRange([loaded, totalSize])}, ${formatSize(speed, 2)}/s, ETA: ${formatTime(timeLeft)}`,
         progress: loaded / totalSize
       };
     }
@@ -194,6 +234,10 @@ document.querySelectorAll('[data-b2-file]').forEach(input => {
         throw new Error(`File should not exceed ${settings.sizeCapGB} GB`);
       }
 
+      if (settings.verifyCallback) {
+        await window[settings.verifyCallback](file);
+      }
+
       const checksum = await loadFileChecksum(file, progress => pr.report({ message: 'Computing checksum…', progress: progress }));
       console.log('Checksum: ' + checksum);
 
@@ -202,24 +246,27 @@ document.querySelectorAll('[data-b2-file]').forEach(input => {
 
       let ret;
       if (file.size > settings.chunkSizeUpload) {
-        const headers = { 'X-File-Name': file.name.replace(/[^a-z0-9!~_.-]/ig, '') || 'unnamed.bin', 'X-File-Checksum': checksum, 'X-File-Size': file.size };
-        ret = await (await fetch('/api/plugin-b2/large-file', { method: 'POST', headers: headers })).json();
+        const headers = Object.assign(
+          { 'X-File-Name': file.name.replace(/[^a-z0-9!~_.-]/ig, '') || 'unnamed.bin', 'X-File-Checksum': checksum, 'X-File-Size': file.size },
+          baseHeaders);
+        ret = await (await fetch(`${domain}/api/plugin-b2/large-file`, { method: 'POST', headers: headers })).json();
         for (let i = 0, a = 5; !ret.url && i < 10000; ++i) {
-          if (!ret.total || typeof ret.next !== 'number' || !ret.chunk) throw new Error(`Malformed response: ${JSON.stringify(ret)}`);
-          console.log(`Piece: ${i}, ${ret.next} out of ${ret.total}`);
-          progress.subrange(ret.next, ret.total);
+          if (!ret.total || !Array.isArray(ret.next) || ret.next.length === 0 || !ret.chunk) throw new Error(`Malformed response: ${JSON.stringify(ret)}`);
+          const nextIndex = ret.next[0];
+          console.log(`Piece: ${i}, ${nextIndex} out of ${ret.total}, chunks left: [${ret.next.join(', ')}]`);
+          progress.subrange(nextIndex, ret.total);
           try {
             ret = await uploadChunk({
               url: '/api/plugin-b2/large-file',
-              data: file.slice(ret.next * ret.chunk, (ret.next + 1) * ret.chunk),
-              headers: Object.assign({ 'X-Chunk-Index': ret.next }, headers),
-              progressListener: ev => pr.report(ev.loaded === ev.total && ret.next + 1 === ret.total
+              data: file.slice(nextIndex * ret.chunk, (nextIndex + 1) * ret.chunk),
+              headers: Object.assign({ 'X-Chunk-Index': nextIndex }, headers),
+              progressListener: ev => pr.report(ev.loaded === ev.total && nextIndex + 1 === ret.total
                 ? { message: `Waiting for server to process the data…` } : progress.get(ev.loaded)),
               cancellableListener: fn => pr.cancellable(fn)
             });
           } catch (e) {
             if (--a > 0) {
-              ret = await (await fetch('/api/plugin-b2/large-file', { method: 'POST', headers: headers })).json();
+              ret = await (await fetch(`${domain}/api/plugin-b2/large-file`, { method: 'POST', headers: headers })).json();
             } else {
               throw e;
             }
@@ -227,8 +274,8 @@ document.querySelectorAll('[data-b2-file]').forEach(input => {
         }
       } else {
         ret = await uploadChunk({
-          url: '/api/plugin-b2/file',
-          headers: { 'X-File-Name': file.name.replace(/[^a-z0-9!~_.-]/ig, '') || 'unnamed.bin', 'X-File-Checksum': checksum },
+          url: `${domain}/api/plugin-b2/file`,
+          headers: Object.assign({ 'X-File-Name': file.name.replace(/[^a-z0-9!~_.-]/ig, '') || 'unnamed.bin', 'X-File-Checksum': checksum }, baseHeaders),
           data: file,
           progressListener: ev => pr.report(ev.loaded === ev.total
             ? { message: `Waiting for server to process the data…` } : progress.get(ev.loaded)),

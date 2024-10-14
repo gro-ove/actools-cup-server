@@ -12,7 +12,7 @@ Hooks.register('plugin.overview.users.menu', (menu, $) => {
   if ($.can(Access.MODERATE)) menu.push(<a href="/manage/tool/invite">Add user…</a>);
 }, 0);
 
-Hooks.register('core.userStats.registered', (menu, { userData }, $) => $.can(Access.MODERATE) && userData.inviteMark && menu.push(<> (invite mark: <Co.Link href={userData.inviteKey ? `/manage/invite/${userData.inviteKey.toString(36)}` : null}>{userData.inviteMark}</Co.Link>)</>));
+Hooks.register('core.userStats.registered', (menu, $, { userData }) => $.can(Access.MODERATE) && userData.inviteMark && menu.push(<> (invite mark: <Co.Link href={userData.inviteKey ? U`/manage/invite/${userData.inviteKey.toString(36)}` : null}>{userData.inviteMark}</Co.Link>)</>));
 
 const tblInvites = db.table('p_invites', {
   inviteKey: db.row.integer({ primary: true }),
@@ -25,12 +25,12 @@ const tblInvites = db.table('p_invites', {
 Server.get('/manage/tool/invite', $ => {
   $.writes(Access.MODERATE);
   return <Co.Page title="Invite user…">
-    <Co.MainForm.Start />
+    <Co.MainForm.Start unique />
     <ul class="form">
       <Co.Row key="inviteMark">Invite mark</Co.Row>
       <Co.Row key="userID" placeholder="Optional">Username</Co.Row>
       <h3>Account access:</h3>
-      <Co.Row accessMask={Access.REGULAR}>Permissions</Co.Row>
+      <Co.Row accessMask={Access.DEFAULT}>Permissions</Co.Row>
       <Co.Row key="allowedFilter" attributes={{ class: 'mono' }}>ID filter</Co.Row>
       <hr />
       <Co.InlineMenu>
@@ -50,10 +50,10 @@ Server.post('/manage/tool/invite', $ => {
   if (invitedUserID) {
     const invite = db.query(`SELECT * FROM ${tblInvites} WHERE invitedUserID=?1`).get(invitedUserID);
     if (invite) {
-      throw $.requestError(<>ID is already used by a different <a href={`/manage/invite/${invite.inviteKey.toString(36)}`}>invite</a>{invite.claimedUserKey ? <> claimed by <Co.UserURL userKey={invite.claimedUserKey} /></> : null}</>);
+      throw $.requestError(<>ID is already used by a different <a href={U`/manage/invite/${invite.inviteKey.toString(36)}`}>invite</a>{invite.claimedUserKey ? <> claimed by <Co.UserLink userKey={invite.claimedUserKey} /></> : null}</>);
     }
     if (db.query(`SELECT * FROM ${DBTbl.Users} WHERE userID=?1`).get(invitedUserID)) {
-      throw $.requestError(<>ID is already used by <Co.UserURL userID={invitedUserID} /></>);
+      throw $.requestError(<>ID is already used by <Co.UserLink userID={invitedUserID} /></>);
     }
   }
   const inviteData = {
@@ -63,7 +63,7 @@ Server.post('/manage/tool/invite', $ => {
     accessMask: Object.values(Access).filter(x => $.params[`perm-${x}`] === 'on' && $.canSetPermission(x)).reduce((p, v) => p | v, 0)
   };
   const inserted = db.query(`INSERT INTO ${tblInvites} (inviteKey, invitedUserID, inviteData) VALUES (?1, ?2, ?3)`).run(id, invitedUserID, JSON.stringify(inviteData)).lastInsertRowid;
-  return `/manage/invite/${inserted.toString(36)}`;
+  return U`/manage/invite/${inserted.toString(36)}`;
 });
 
 Server.get('/manage/invite', $ => {
@@ -73,14 +73,14 @@ Server.get('/manage/invite', $ => {
       {db.query(`SELECT * FROM ${tblInvites} ORDER BY CASE WHEN claimedUserKey IS NULL THEN 0 ELSE 1 END, -createdDate`).all().map(x => {
         const inviteData = JSON.parse(x.inviteData);
         return <li class="details" data-disabled={!!x.claimedUserKey}>
-          <a href={`/manage/invite/${x.inviteKey.toString(36)}`}>Invite <span class="mono">#{x.inviteKey.toString(36)}</span></a>
+          <a href={U`/manage/invite/${x.inviteKey.toString(36)}`}>Invite <span class="mono">#{x.inviteKey.toString(36)}</span></a>
           <div>
             <Co.InlineMenu>
               <Co.Date value={x.createdDate} />
-              {inviteData.inviteeUserID ? <>Created by <Co.UserURL userID={inviteData.inviteeUserID} /></> : null}
+              {inviteData.inviteeUserID ? <>Created by <Co.UserLink userID={inviteData.inviteeUserID} /></> : null}
               {inviteData.inviteMark ? <span>Mark: <Co.Value placeholder="none">{inviteData.inviteMark}</Co.Value></span> : null}
               {x.invitedUserID ? <>For {x.invitedUserID}</> : null}
-              {x.claimedUserKey ? <>Claimed by <Co.UserURL userKey={x.claimedUserKey} /></> : null}
+              {x.claimedUserKey ? <>Claimed by <Co.UserLink userKey={x.claimedUserKey} /></> : null}
             </Co.InlineMenu>
           </div>
         </li>;
@@ -105,16 +105,17 @@ Server.get('/manage/invite/:inviteKey', $ => {
     return <Co.Page title="Invite to a CUP v2">
       <ul class="form">
         <p>{data.claimedUserKey != null
-          ? <>Invite claimed by <Co.UserURL userKey={data.claimedUserKey} /> <Co.Date value={db.query(`SELECT createdDate FROM ${DBTbl.Users} WHERE userKey=?1`).get(data.claimedUserKey).createdDate} />.</>
+          ? <>Invite claimed by <Co.UserLink userKey={data.claimedUserKey} /> <Co.Date value={db.query(`SELECT createdDate FROM ${DBTbl.Users} WHERE userKey=?1`).get(data.claimedUserKey).createdDate} />.</>
           : <>Unclaimed invite{data.invitedUserID ? ` for ${data.invitedUserID} ` : null}.</>}</p>
         <li>Created: <Co.Date value={data.createdDate} /></li>
-        <li>Created by: <Co.UserURL userID={inviteData.inviteeUserID} /></li>
+        <li>Created by: <Co.UserLink userID={inviteData.inviteeUserID} /></li>
+        {$.can(Access.MODERATE) ? <li>Invite mark: <Co.FormattedMessage value={inviteData.inviteMark} /></li> : null}
         <h3>Account access:</h3>
         <li>Permissions: <Co.PermissionsList value={inviteData.accessMask} short /></li>
         <li>ID filter: <Co.Value placeholder="any" mono>{inviteData.allowedFilter}</Co.Value></li>
         <hr />
         <Co.InlineMenu>
-          <a href={`data:text/plain;base64,${btoa($.req.url)}`} onclick={`navigator.clipboard.writeText(${JSON.stringify($.req.url)});this.textContent="URL copied";return false`}>Copy URL</a>
+          <a href={`data:text/plain;base64,${btoa($.requestURL)}`} onclick={`navigator.clipboard.writeText(${JSON.stringify($.requestURL)});this.textContent="URL copied";return false`}>Copy URL</a>
           <Co.Link action="/manage/command/logout" args={{ location: 'current' }}>Log out to claim</Co.Link>
           {$.can(Access.MODERATE) ? <Co.Link href="/manage/tool/invite">Invite a user…</Co.Link> : null}
           {$.can(Access.MODERATE) ? <Co.Link action="/manage/command/invite-delete" args={{ inviteKey: data.inviteKey }} query="Are you sure to completely delete an invite?">Delete invite…</Co.Link> : null}
@@ -136,9 +137,9 @@ Server.get('/manage/invite/:inviteKey', $ => {
     <ul class="form">
       <Co.MainForm.Start autocomplete />
       <p>You got an invite to a new CUP moderation tool. Please fill out the form to proceed:</p>
-      <Co.Row data={{ userID: data.invitedUserID }} key="userID" readonly={data.invitedUserID != null} required={data.invitedUserID == null} hint={data.invitedUserID ? `This invite is created especially for ${data.invitedUserID}` : 'Used as an account login, can’t be changed later'}
+      <Co.Row data={{ userID: data.invitedUserID }} key="userID" readonly={data.invitedUserID != null} required={data.invitedUserID == null} title={data.invitedUserID ? `This invite is created especially for ${data.invitedUserID}` : 'Used as an account login, can’t be changed later'}
         attributes={{ autocomplete: 'username' }}>Username</Co.Row>
-      <Co.Row key="password" attributes={{ type: 'password', autocomplete: 'new-password' }} required hint="Password can be changed later">Password</Co.Row>
+      <Co.Row key="password" attributes={{ type: 'password', autocomplete: 'new-password' }} required title="Password can be changed later">Password</Co.Row>
       <hr />
       <Co.InlineMenu>
         <Co.MainForm.End>Sign up</Co.MainForm.End>
@@ -160,7 +161,7 @@ Server.post('/manage/invite/:inviteKey', $ => {
     throw $.requestError('You already are signed in', <Co.Link action="/manage/command/logout" args={{ location: 'current' }}>Log out and try again</Co.Link>);
   }
   if (data.claimedUserKey) {
-    throw $.requestError(<>Invite has already been claimed by <Co.UserURL userKey={data.claimedUserKey} /></>);
+    throw $.requestError(<>Invite has already been claimed by <Co.UserLink userKey={data.claimedUserKey} /></>);
   }
 
   const inviteData = JSON.parse(data.inviteData);
@@ -169,9 +170,10 @@ Server.post('/manage/invite/:inviteKey', $ => {
     throw $.requestError(`Incorrect user ID`);
   }
 
-  if (db.query(`SELECT userID FROM ${DBTbl.Users} WHERE userID=?1`).get(userID) != null) {
-    throw $.requestError(<>The username <b>{userID}</b> is already used by a different user</>,
-      <a href={`/manage/invite/${$.params.inviteKey}`}>Try a different username</a>,
+  const existing = db.query(`SELECT userID FROM ${DBTbl.Users} WHERE userID=?1 COLLATE NOCASE`).get(userID);
+  if (existing != null) {
+    throw $.requestError(<>The username <b>{userID}</b> is already used by a user <b>{existing.userID}</b></>,
+      <a href={U`/manage/invite/${$.params.inviteKey}`}>Try a different username</a>,
       <G $hook={{ 'plugin.invites.signInLink': { userID } }}>
         <Co.Link href="/manage">Try to sign in</Co.Link>
       </G>);
@@ -191,7 +193,7 @@ Server.post('/manage/command/invite-delete', $ => {
   $.writes(Access.MODERATE);
   const data = tblInvites.get($.params.inviteKey);
   if (!data) return null;
-  $.undo(`Invite #${data.inviteKey.toString(36)} erased`, () => {
+  $.undo(`Invite #${data.inviteKey.toString(36)} erased.`, () => {
     const restoredKey = tblInvites.insert(data);
     if (data.claimedUserKey) {
       const user = DBTbl.Users.get(data.claimedUserKey);
@@ -199,7 +201,7 @@ Server.post('/manage/command/invite-delete', $ => {
       userData.inviteKey = restoredKey;
       db.query(`UPDATE ${DBTbl.Users} SET userData=?2 WHERE userKey=?1`).run(data.claimedUserKey, JSON.stringify(userData));
     }
-    return `/manage/invite/${restoredKey.toString(36)}`;
+    return U`/manage/invite/${restoredKey.toString(36)}`;
   });
   {
     using _ = db.write().start();

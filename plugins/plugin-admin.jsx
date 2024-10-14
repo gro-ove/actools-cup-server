@@ -1,5 +1,5 @@
 /** Some advanced moderation tools. */
-import { Access, AppSettings, Co, db, Hooks, pluginSettings, RequestError, resolveCDN, Server, Utils } from '../src/app';
+import { Access, AppSettings, Co, Ctx, db, Hooks, pluginSettings, RequestError, resolveCDN, Server, Utils } from '../src/app';
 import { heapStats } from "bun:jsc";
 import { PerfCounter } from '../src/std';
 
@@ -26,21 +26,23 @@ Hooks.register('core.error', ({ error, $ }) => {
   tblErrors.insert({
     url: $?.req?.url,
     userID: $?.__user?.userID,
-    data: `${error && error.stack || error}\n
-Method: ${$?.req?.method || '?'}
-Headers: ${$?.req?.headers && JSON.stringify([...$.req.headers.keys()].reduce((p, x) => ((p[x] = $.req.headers.get(x)), p), {}), null, 2)}`,
+    data: $
+      ? `${error && error.stack || error}\n
+Method: ${$.req?.method || '?'}
+Headers: ${$.req?.headers && JSON.stringify([...$.req.headers.keys()].reduce((p, x) => ((p[x] = $.req.headers.get(x)), p), {}), null, 2)}`
+      : `${error && error.stack || error}\n(Bun serve error.)`,
     createdDate: Date.now() / 1e3
   });
 });
 
 Hooks.register('core.user', (user, $) => {
   if (db.storage.get(KEY_MAINTENANCE_MODE) === true
-    && (!user || !(user.accessMask & Access.MODERATE))) {
+    && (!user || user.accessMask !== Access.ADMIN)) {
     throw new RequestError(500, 'Under maintanence', <Co.Page title="Server under maintanence" center>
       <p>Server is under maintanence. Please try again later.</p>
       <p>
         <Co.InlineMenu>
-          <Co.Link href={$.req.url}>Try again</Co.Link>
+          <Co.Link href={$.requestURL}>Try again</Co.Link>
           <Co.SocialLinks contacts={AppSettings.ownContacts} format="Contact via ?1…" subject="CUP maintanence" />
         </Co.InlineMenu>
       </p>
@@ -56,14 +58,15 @@ Hooks.register('core.tpl.final', (final, $) => {
   }
 }, 100);
 
+const errCountKey = Symbol('errCount');
 function errCount($) {
-  if ($.__errCount == null) {
-    $.__errCount = tblErrors.count();
+  if ($[errCountKey] == null) {
+    $[errCountKey] = tblErrors.count();
   }
-  return $.__errCount;
+  return $[errCountKey];
 }
 
-Hooks.register('core.tpl.userMenu.header', (header, $) => $.user.accessMask === Access.ADMIN && errCount($) && (header.splice(0, Infinity, <>📛 {header[1]}</>)), 1e3);
+Hooks.register('core.tpl.userMenu.header', (header, $) => $.user.accessMask === Access.ADMIN && errCount($) && (header.splice(0, 1, `📛`)), 1e3);
 
 Hooks.register('core.tpl.userMenu', (menu, $) => $.user.accessMask === Access.ADMIN ? menu.push(<G $hook="plugin.admin.tpl.userMenu">
   <hr />
@@ -76,25 +79,50 @@ Hooks.register('core.tpl.userMenu', (menu, $) => $.user.accessMask === Access.AD
   </Co.Dropdown>
 </G>) : null, 100);
 
+let counter = (Math.random() * 1e6) | 0;
+const cmdIncrementCounter = Server.command(() => ++counter);
+const cmdLogCounter = Server.command((counter, userKey) => console.log(counter, userKey));
+const cmdResetCounter = Server.command(function () {
+  let b = counter;
+  this.undo('Counter has been reset.', () => { counter = b });
+  counter = 0;
+}, { query: 'Are you sure?' });
+
 Server.get('/manage/cup', $ => {
-  $.writes(Access.MODERATE);
+  $.writes(Access.ADMIN);
+  const live = $.liveUpdating('1 min', <li>Counter: {counter}</li>);
+  const key = Utils.uid();
   return <Co.Page title="CUP">
     <ul class="form">
       <li><Co.Link href='/manage/cup/errors'>Errors ({errCount($)})</Co.Link></li>
       <li><Co.Link href='/manage/cup/report'>Status</Co.Link></li>
       <li><Co.Link href='/manage/cup/tool'>Tools</Co.Link></li>
       <li><Co.Link href='/manage/cup/settings'>Settings</Co.Link></li>
+      <hr />
+      <h3>Perm. test:</h3>
+      <li>User.accessMask: {$.user.accessMask}</li>
+      <hr />
+      <h3>Undo test:</h3>
+      {live[0]}
+      <li><Co.Link data-live-apply action={cmdIncrementCounter()}>Increment counter</Co.Link></li>
+      <li><Co.Link action={cmdLogCounter(counter, $.user.userKey)}>Log counter</Co.Link></li>
+      <li><Co.Link action={cmdResetCounter()}>Reset counter…</Co.Link></li>
+      <hr />
+      <h3>Action test:</h3>
+      <li><Co.Link action={() => $.toast(null, 'Hello world! Value: ' + $.params.got)}>Test</Co.Link></li>
+      <li><Co.Link action={$ => $.toast(null, 'Now: ' + key + ', was: ' + $.params.key)} args={{key}}>Random: {key}</Co.Link></li>
+      <li><Co.Link action={() => $.toast(null, 'URL: ' + $.requestURL)}>Get URL</Co.Link></li>
     </ul>
   </Co.Page>;
 });
 
 Server.get('/manage/cup/tool', $ => {
-  $.writes(Access.MODERATE);
+  $.writes(Access.ADMIN);
   return <Co.Page title="Tools">
     <ul class="form">
       <h3>Online users:</h3>
       {
-        $.onlineUserIDs.map(x => <li><Co.UserURL userID={x} hide-online-mark /></li>)
+        $.onlineUserIDs.map(x => <li><Co.UserLink userID={x} hide-online-mark /></li>)
       }
       <hr />
       <h3>Tools:</h3>
@@ -109,7 +137,7 @@ Server.get('/manage/cup/tool', $ => {
 });
 
 Server.get('/manage/cup/report', $ => {
-  $.writes(Access.MODERATE);
+  $.writes(Access.ADMIN);
 
   function perfReport(perf, entryFmt) {
     if (!perf.history) {
@@ -183,20 +211,22 @@ Server.get('/manage/cup/settings', $ => {
   </Co.Page>;
 });
 
+const cmdDeleteByDate = Server.command(createdDate => db.query(`DELETE FROM ${tblErrors} WHERE createdDate=?1`).run(createdDate));
+const cmdDeleteByURL = Server.command(url => db.query(`DELETE FROM ${tblErrors} WHERE url=?1`).run(url));
+const cmdDeleteByMessage = Server.command(message => db.query(`DELETE FROM ${tblErrors} WHERE data LIKE ?1`).run(message + '\n%'));
+const cmdToggleErrorsCollection = Server.command(() => db.storage.set(KEY_PAUSE_ERRORS_COLLECTION, !db.storage.get(KEY_PAUSE_ERRORS_COLLECTION)));
+const cmdClearErrors = Server.command(() => tblErrors.clear());
 Server.get('/manage/cup/errors', $ => {
   $.writes(Access.ADMIN);
-  const list = $.liveUpdating(30, <ul class="form">
+  const list = $.liveUpdating('30 s', <ul class="form">
     {db.query(`SELECT * FROM ${tblErrors} ORDER BY -createdDate`).all().map(x => <li data-search={x.data}>
       <Co.InlineMenu>
         <Co.Date value={x.createdDate} />
         {x.url ? <Co.Link href={x.url}>{x.url.replace(/^[^\/]+\/\/[^\/]+\//, '/')}</Co.Link> : null}
-        {x.userID ? <Co.UserURL userID={x.userID} /> : null}
-        <Co.Link action={$ => {
-          db.query(`DELETE FROM ${tblErrors} WHERE createdDate=?1`).run($.params.createdDate);
-        }} args={{ createdDate: x.createdDate }} data-live-apply>remove</Co.Link>
-        {x.url ? <Co.Link action={$ => {
-          db.query(`DELETE FROM ${tblErrors} WHERE url=?1`).run($.params.url);
-        }} args={{ url: x.url }} data-live-apply>remove by URL</Co.Link> : null}
+        {x.userID ? <Co.UserLink userID={x.userID} /> : null}
+        <Co.Link action={cmdDeleteByDate(x.createdDate)} data-live-apply>remove</Co.Link>
+        {x.url ? <Co.Link action={cmdDeleteByURL(x.url)} data-live-apply>remove by URL</Co.Link> : null}
+        {x.data.indexOf('\n') !== -1 ? <Co.Link action={cmdDeleteByMessage(x.data.split('\n', 1)[0])} data-live-apply>remove by message</Co.Link> : null}
       </Co.InlineMenu>
       <pre class="details">{x.data}</pre>
     </li>)}
@@ -204,12 +234,8 @@ Server.get('/manage/cup/errors', $ => {
   return <Co.Page title="Errors" search>
     <ul class="form">
       <Co.InlineMenu>
-        <Co.Link action={() => {
-          db.storage.set(KEY_PAUSE_ERRORS_COLLECTION, !db.storage.get(KEY_PAUSE_ERRORS_COLLECTION));
-        }}>{db.storage.get(KEY_PAUSE_ERRORS_COLLECTION) ? `Enable errors collection` : `Disable errors collection`}</Co.Link>
-        <Co.Link action={() => {
-          db.query(`DELETE FROM ${tblErrors}`).run();
-        }} query="Are you sure to remove all error reports?" data-live-apply>Clear out everything…</Co.Link>
+        <Co.Link action={cmdToggleErrorsCollection()}>{db.storage.get(KEY_PAUSE_ERRORS_COLLECTION) ? `Enable errors collection` : `Disable errors collection`}</Co.Link>
+        <Co.Link action={cmdClearErrors()} query="Are you sure to remove all error reports?" data-live-apply>Clear out everything…</Co.Link>
       </Co.InlineMenu>
       <hr />
     </ul>
@@ -226,25 +252,25 @@ Server.post('/manage/cup/settings', $ => {
 });
 
 Server.post('/manage/cup/tool/maintanence', $ => {
-  $.writes(Access.MODERATE);
+  $.writes(Access.ADMIN);
   db.storage.set(KEY_MAINTENANCE_MODE, !db.storage.get(KEY_MAINTENANCE_MODE));
   return `/manage/cup/tool`;
 });
 
 Server.post('/manage/cup/tool/dbgc', $ => {
-  $.writes(Access.MODERATE);
+  $.writes(Access.ADMIN);
   Bun.gc(true);
   return `/manage/cup/tool`;
 });
 
 Server.post('/manage/cup/tool/gc', $ => {
-  $.writes(Access.MODERATE);
+  $.writes(Access.ADMIN);
   db.exec('VACUUM; PRAGMA wal_checkpoint(TRUNCATE);');
   return `/manage/cup/tool`;
 });
 
 Server.post('/manage/cup/tool/backup', $ => {
-  $.writes(Access.MODERATE);
+  $.writes(Access.ADMIN);
   const data = Bun.gzipSync(Utils.tar([{ key: 'data.db', data: db.serialize() }]));
   return new Response(data, { headers: { 'Content-Disposition': `attachment; filename=cup-bak-${+Date.now() / 1e3 | 0}.tar.gz` } });
 });

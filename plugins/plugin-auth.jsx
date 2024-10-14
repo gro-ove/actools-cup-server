@@ -1,6 +1,6 @@
 /** Replaces basic HTTP authentification with a nice modern one. */
 import { Hooks, DBTbl, RequestError, Server, db, pluginSettings, Co, Utils, Ctx, Access, AppSettings } from '../src/app';
-import { Sqid, Timer } from '../src/std';
+import { CookieHandler, jsExt, Sqid, Timer } from '../src/std';
 
 const Settings = pluginSettings('auth', {
   sessionTokenKey: null,
@@ -9,7 +9,7 @@ const Settings = pluginSettings('auth', {
   sessionMaxAge: s.sessionMaxAge
 }));
 
-const tblSessions = Object.assign(db.table('p_auth', {
+const tblSessions = db.table('p_auth', {
   sessionKey: db.row.integer({ primary: true }),
   sessionCode: db.row.text(),
   userKey: db.row.integer({ index: true }),
@@ -18,39 +18,44 @@ const tblSessions = Object.assign(db.table('p_auth', {
   sessionData: db.row.text({ default: '{"previousIPs":[]}' }),
   lastIP: db.row.text(),
   lastBrowser: db.row.text(),
-}, { version: 1 }), {
-  keySqid: new Sqid(Settings.sessionTokenKey),
-  encode(code, key) {
-    key = this.keySqid.encode(key, Math.random() * 15 | 0);
-    return `${this.keySqid.key[key.length]}${code}${key}`;
-  },
-  decode(encoded) {
-    const len = encoded ? this.keySqid.key.indexOf(encoded[0]) : -1;
-    const key = len !== -1 && this.keySqid.decode(encoded.substring(encoded.length - len));
-    return key ? { code: encoded.substring(1, encoded.length - len), key } : null;
-  },
-  delete(sessionKey) {
-    db.query(`DELETE FROM ${this} WHERE sessionKey=?1`).run(sessionKey);
-  },
-  gc() {
-    db.query(`DELETE FROM ${this} WHERE lastUsedDate < ?1`).run(+db.value.now - Timer.seconds(Settings.sessionMaxAge));
-  },
+}, { version: 1 }).extend(tbl => {
+  const keySqid = new Sqid(Settings.sessionTokenKey);
+  const pDelete = tbl.pdelete('sessionKey');
+  return {
+    encode(code, key) {
+      key = keySqid.encode(key, Math.random() * 15 | 0);
+      return `${keySqid.key[key.length]}${code}${key}`;
+    },
+    decode(encoded) {
+      const len = encoded ? keySqid.key.indexOf(encoded[0]) : -1;
+      const key = len !== -1 && keySqid.decode(encoded.substring(encoded.length - len));
+      return typeof key === 'number' ? { code: encoded.substring(1, encoded.length - len), key } : null;
+    },
+    deleteSession(sessionKey) { pDelete(sessionKey); },
+    gc: db.bound(`DELETE FROM ${tbl} WHERE lastUsedDate < ?1`, s => s.run(+db.value.now - Timer.seconds(Settings.sessionMaxAge))),
+  }
 });
 
-function gcCallback() {
-  tblSessions.gc();
-  setTimeout(gcCallback, Timer.ms(Settings.sessionMaxAge) / 10);
-}
-setTimeout(gcCallback, 10e3);
+Timer.service(Timer.ms(Settings.sessionMaxAge) / 10, () => tblSessions.gc());
 
-Hooks.register('core.tpl.userPage.menu', (menu, { user }, $) => {
-  if (user.userKey !== $.user.userKey && !$.can(Access.ADMIN)) return;
-  menu.splice(1, 0, <Co.Link href={user.userKey !== $.user.userKey ? `/manage/sessions?userID=${user.userID}` : `/manage/sessions`}>View active sessions</Co.Link>);
+Hooks.register('core.tpl.final', (final, $) => {
+  if (!final.header && $.url.pathname !== '/manage/sign') {
+    final.header = `<header><div class=header-right><a href="/manage">Sign in…</a></div>${<G $hook="core.tpl.header"></G>}</header>`;
+  }
+}, -10);
+
+Hooks.register('core.tpl.userPage.menu', (menu, $, { user }) => {
+  if (user.userKey === $.user.userKey || $.can(Access.ADMIN)) {
+    menu.splice(1, 0, <Co.Link href={user.userKey !== $.user.userKey ? `/manage/sessions?userID=${user.userID}` : `/manage/sessions`}>View active sessions</Co.Link>);
+  }
+  if ($.can(Access.ADMIN)) {
+    menu.push(<Co.Link href="/manage/sign" args={{ as: CookieHandler.encode({ userID: user.userID, ownID: $.user.userID, ownSession: $.cookies.get('CupManageAuth') }) }} danger>Sign in as {user.userID}</Co.Link>);
+  }
 }, 10);
 
 Hooks.register('plugin.admin.stats', fn => fn({
   ['Sessions']: {
-    'Active': db.query(`SELECT COUNT(*) AS count FROM ${tblSessions}`).get().count
+    'Active': db.query(`SELECT COUNT(*) AS count FROM ${tblSessions}`).get().count,
   }
 }));
 
@@ -61,7 +66,7 @@ function getBrowserID($) {
 function removeCurrentSession($) {
   const read = tblSessions.decode($.cookies.get('CupManageAuth'));
   if (read) {
-    tblSessions.delete(read.key);
+    tblSessions.deleteSession(read.key);
   }
 }
 
@@ -72,47 +77,85 @@ function removeOtherSessions($) {
   }
 }
 
+const pGetSessionCode = tblSessions.pget(['sessionCode'], 'sessionKey');
+const pGetSession = tblSessions.pget(['userKey', 'sessionCode', 'lastUsedDate', 'lastIP', 'lastBrowser'], 'sessionKey');
+const pUpdateSessionLastUsed = tblSessions.pupdate('sessionKey', [], { lastUsedDate: db.value.now });
+const pUpdateNewIP = tblSessions.pupdate('sessionKey', ['lastIP', 'sessionData']);
+const pUpdateNewBrowser = tblSessions.pupdate('sessionKey', 'lastBrowser');
+
 Hooks.register('core.user.signedCheck', /** @param {Ctx} $ */ $ => {
   const read = tblSessions.decode($.cookies.get('CupManageAuth'));
-  const session = read && db.query(`SELECT userKey, sessionCode, lastUsedDate, lastIP, lastBrowser FROM ${tblSessions} WHERE sessionKey=?1`).get(read.key);
+  const session = read && pGetSessionCode(read.key);
   return session != null && session.sessionCode === read.code;
 });
 
+export function getPublicSessionToken($) {
+  return Buffer.from(JSON.stringify([$.___session[0], Bun.sha($.___session[1].sessionCode, 'base64')])).toString('base64url');
+}
+
+/** @param {Ctx} $ */
+export function verifyPublicSessionToken($, token) {
+  const parsed = token && JSON.tryParse(Buffer.from(token, 'base64url').toString('utf8'));
+  if (!Array.isArray(parsed) || parsed.length !== 2 || typeof parsed[0] !== 'number' || typeof parsed[1] !== 'string') {
+    throw new RequestError(401);
+  }
+
+  const session = pGetSession(parsed[0]);
+  if (!session || Bun.sha(session.sessionCode, 'base64') !== parsed[1]) {
+    throw new RequestError(401);
+  }
+
+  const ageS = +db.value.now - session.lastUsedDate;
+  if (ageS > Timer.seconds(Settings.sessionMaxAge) * 0.1
+    || getBrowserID($) !== session.lastBrowser) {
+    throw new RequestError(401);
+  }
+
+  // Skip other checks here, IP can be different, for example
+  $.__user = db.query(`SELECT ${$.requiredUserFields} FROM ${DBTbl.Users} WHERE userKey=?1`).get(session.userKey)
+}
+
 Hooks.register('core.user.auth', /** @param {Ctx} $ */ $ => {
   const read = tblSessions.decode($.cookies.get('CupManageAuth'));
-  const session = read && db.query(`SELECT userKey, sessionCode, lastUsedDate, lastIP, lastBrowser FROM ${tblSessions} WHERE sessionKey=?1`).get(read.key);
+  const session = read && pGetSession(read.key);
   if (!session || session.sessionCode !== read.code) return null;
 
+  const isDevSession = read.key === 0;
   const ageS = +db.value.now - session.lastUsedDate;
   using t = db.write();
   if (ageS > 60) {
-    if (ageS > Timer.seconds(Settings.sessionMaxAge)) {
-      tblSessions.delete(read.key);
+    if (ageS > Timer.seconds(Settings.sessionMaxAge) * (isDevSession ? 0.1 : 1)) {
+      tblSessions.deleteSession(read.key);
       return null;
     } else {
-      t.query(`UPDATE ${tblSessions} SET lastUsedDate=?2 WHERE sessionKey=?1`).run(read.key, +db.value.now);
+      t.start();
+      pUpdateSessionLastUsed(read.key);
     }
   }
+
+  $.___session = [read.key, session];
 
   const ip = $.requestIP;
   const browser = getBrowserID($);
   if (ip !== session.lastIP) {
-    if (browser !== session.lastBrowser) {
-      tblSessions.delete(read.key);
+    if (browser !== session.lastBrowser || isDevSession) {
+      tblSessions.deleteSession(read.key);
       return null;
     }
 
     const sessionData = JSON.parse(db.query(`SELECT sessionData FROM ${tblSessions} WHERE sessionKey=?1`).get(read.key).sessionData);
     sessionData.previousIPs.push(session.lastIP);
-    t.query(`UPDATE ${tblSessions} SET sessionData=?2, lastIP=?3 WHERE sessionKey=?1`).run(read.key, JSON.stringify(sessionData), ip);
-  } else if (browser !== session.lastBrowser) {
-    t.query(`UPDATE ${tblSessions} SET lastBrowser=?2 WHERE sessionKey=?1`).run(read.key, browser);
+    t.start();
+    pUpdateNewIP(read.key, { sessionData: JSON.stringify(sessionData), lastIP: ip });
+  } else if (browser !== session.lastBrowser || isDevSession) {
+    t.start();
+    pUpdateNewBrowser(read.key, browser);
   }
 
   const user = db.query(`SELECT ${$.requiredUserFields} FROM ${DBTbl.Users} WHERE userKey=?1`).get(session.userKey);
-  if (user && +db.value.now > user.lastSeenDate + 10) {
-    user.lastSeenDate = +db.value.now;
-    t.query(`UPDATE ${DBTbl.Users} SET lastSeenDate=?2 WHERE userKey=?1`).run(user.userKey, +db.value.now);
+  if (isDevSession && user) {
+    user._invisible = true;
+    user.introduced = 1;
   }
   return user || null;
 });
@@ -137,7 +180,7 @@ Hooks.register('core.user.changingPassword', $ => {
 
 Hooks.register('core.tpl.changePasswordForm', body => body.splice(0, 0, <p>Changing password will invalidate all other sessions.</p>));
 
-function SignForm(props) {
+function SignPage(props) {
   return <Co.Page title="Sign in" center>
     <Co.MainForm.Start autocomplete action="/manage/sign" />
     {props.redirect ? <input type="hidden" value={props.redirect} name="redirect" /> : null}
@@ -147,7 +190,7 @@ function SignForm(props) {
       <Co.Row key="password" attributes={{ type: 'password', autocomplete: 'current-password', required: true, 'data-password-toggle': true }}>Password</Co.Row>
       <hr />
       <Co.InlineMenu>
-        <Co.MainForm.End>{props.signed ? 'Switch account' : `Sign in`}</Co.MainForm.End>
+        <Co.MainForm.End>Sign in</Co.MainForm.End>
         {props.signed ? <Co.Link action="/manage/command/logout">Log out</Co.Link> : null}
         {props.signed ? null : <Co.Dropdown label="Request an invite…" href="#"><Co.SocialLinks contacts={AppSettings.ownContacts} format="Contact via ?1…" subject="CUP invite" /></Co.Dropdown>}
       </Co.InlineMenu>
@@ -158,7 +201,7 @@ function SignForm(props) {
 Server.get('/manage/cookie-test', $ => {
   $.cookies.set('test0', new Date().toLocaleString());
   $.cookies.set('test1', Date.now());
-  $.cookies.set('test2', $.user);
+  $.cookies.set('test2', { someWeirdObject: { a: 1, b: '2', c: true } });
   $.cookies.set('test3', ['repeat'.repeat(10)]);
   $.cookies.set('test4', 'short');
   return <pre>{JSON.stringify([
@@ -167,14 +210,29 @@ Server.get('/manage/cookie-test', $ => {
     $.cookies.get('test2'),
     $.cookies.get('test3'),
     $.cookies.get('test4'),
+    $.requestIP,
+    Object.fromEntries($.req.headers),
   ], null, 2)}</pre>;
 });
 
-Server.get('/manage/sign', $ => {
-  return <SignForm
-    redirect={$.cookies.get('CupManageRedirect') === '/manage/sign' ? '/manage' : $.cookies.get('CupManageRedirect')}
-    signed={$.signed} />;
-});
+function applySignIn($, userKey, devSession) {
+  using t = db.write();
+  const code = Utils.uid(16);
+
+  let key;
+  if (devSession) {
+    tblSessions.deleteSession(0);
+    t.query(`INSERT INTO ${tblSessions} (sessionKey, sessionCode, userKey, lastIP, lastBrowser) VALUES (0, ?1, ?2, ?3, ?4)`).run(code, userKey, $.requestIP, getBrowserID($));
+    key = 0;
+  } else {
+    key = t.query(`INSERT INTO ${tblSessions} (sessionCode, userKey, lastIP, lastBrowser) VALUES (?1, ?2, ?3, ?4)`).run(code, userKey, $.requestIP, getBrowserID($)).lastInsertRowid;
+    t.query(`WITH latest_sessions AS ( SELECT sessionKey FROM ${tblSessions} WHERE userKey = ?1 ORDER BY createdDate DESC LIMIT 10 )
+    DELETE FROM ${tblSessions} WHERE userKey = ?1 AND sessionKey NOT IN latest_sessions`).run(userKey);
+  }
+
+  const encoded = tblSessions.encode(code, key);
+  $.cookies.set('CupManageAuth', encoded, { age: Settings.sessionMaxAge, httpOnly: true, secure__: true /* TODO */ });
+}
 
 function signIn($, username, password) {
   const user = db.query(`SELECT ${$.requiredUserFields}, password FROM ${DBTbl.Users} WHERE userID=?1`).get(username);
@@ -182,18 +240,38 @@ function signIn($, username, password) {
     return false;
   }
 
-  using t = db.write();
-  const code = Utils.uid(16);
-  const key = t.query(`INSERT INTO ${tblSessions} (sessionCode, userKey, lastIP, lastBrowser) VALUES (?1, ?2, ?3, ?4)`).run(code, user.userKey, $.requestIP, getBrowserID($)).lastInsertRowid;
-
-  t.query(`WITH latest_sessions AS ( SELECT sessionKey FROM ${tblSessions} WHERE userKey = ?1 ORDER BY createdDate DESC LIMIT 10 )
-    DELETE FROM ${tblSessions} WHERE userKey = ?1 AND sessionKey NOT IN latest_sessions`).run(user.userKey);
-
-  const encoded = tblSessions.encode(code, key);
-  $.cookies.set('CupManageAuth', encoded, { age: Settings.sessionMaxAge, httpOnly: true, secure: true });
+  applySignIn($, user.userKey, false);
   $.__user = user;
   return true;
 }
+
+Server.get('/manage/sign', $ => {
+  const signAs = CookieHandler.decode($.params.as);
+  if (signAs) {
+    if ($.signed) {
+      $.toast('warn', 'Open URL in an incognito tab to test the account',
+        <Co.Link href={$.requestURL}>Try again</Co.Link>,
+        <Co.Link good onclick="closeToast(this)">OK</Co.Link>);
+      return U`/manage/user/${signAs.userID}`;
+    }
+    const read = tblSessions.decode(signAs.ownSession);
+    const session = read && pGetSession(read.key);
+    if (session
+      && session.userKey === DBTbl.Users.userKey(signAs.ownID)
+      && session.lastIP === $.requestIP
+      && session.lastBrowser === getBrowserID($)
+      && session.lastUsedDate + 3600 > +db.value.now) {
+      applySignIn($, DBTbl.Users.userKey(signAs.userID) || jsExt.raiseError('Incorrect target user ID'), true);
+      $.__user = db.query(`SELECT ${$.requiredUserFields}, password FROM ${DBTbl.Users} WHERE userID=?1`).get(signAs.userID);
+      return U`/manage`;
+    } else {
+      return U`/manage/sign`
+    }
+  }
+  return <SignPage
+    redirect={$.cookies.get('CupManageRedirect') === '/manage/sign' ? '/manage' : $.cookies.get('CupManageRedirect')}
+    signed={$.signed} />;
+});
 
 let signInAttempts = 0;
 
@@ -208,7 +286,7 @@ Server.post('/manage/sign', $ => {
   const password = $.params['data-password'] || '';
   const redirect = $.params['redirect'];
   if (!signIn($, username, password)) {
-    return <SignForm username={username} redirect={redirect} error={
+    return <SignPage username={username} redirect={redirect} error={
       <div>
         {password ? 'Wrong password, please try again' : 'Password is required'}. <Co.Dropdown label="Forgot password?" href="#"><Co.SocialLinks contacts={AppSettings.ownContacts} format="Contact via ?1…" subject="Forgot CUP password" /></Co.Dropdown>
       </div>
@@ -222,15 +300,14 @@ Hooks.register('plugin.invites.claimed', ({ $, userID, password }) => {
   signIn($, userID, password);
 });
 
-Hooks.register('plugin.invites.signInLink', (body, { userID }) => {
-  console.log(userID);
+Hooks.register('plugin.invites.signInLink', (body, $, { userID }) => {
   body.splice(0, Infinity, <Co.Link action={`/manage/sign`} args={{ 'data-username': userID }}>Try to sign in</Co.Link>);
 });
 
 Server.post('/manage/command/session-close', $ => {
   const session = tblSessions.get(parseInt($.params.sessionKey, 36));
   if (!session || !$.can(Access.ADMIN) && session.userKey !== $.user.userKey) return null;
-  tblSessions.delete(session.sessionKey);
+  tblSessions.deleteSession(session.sessionKey);
   return '/manage/sessions';
 });
 
@@ -246,7 +323,7 @@ Server.get('/manage/sessions', $ => {
   const read = tblSessions.decode($.cookies.get('CupManageAuth'));
   const userKey = $.can(Access.ADMIN) && $.params.userID ? DBTbl.Users.userKey($.params.userID) : $.user.userKey;
   const liveUpdating = $.liveUpdating('3hr', <ul class="form">
-    {db.query(`SELECT * FROM ${tblSessions} WHERE userKey=?1 ORDER BY -lastUsedDate`).all(userKey).map(x => {
+    {db.query(`SELECT * FROM ${tblSessions} WHERE userKey=?1 AND sessionKey IS NOT 0 ORDER BY -lastUsedDate`).all(userKey).map(x => {
       const data = JSON.parse(x.sessionData);
       return <li class="details">
         <Co.InlineMenu>

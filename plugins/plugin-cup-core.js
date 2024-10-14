@@ -5,8 +5,7 @@ import { Access, Co, ContentCategories, ContentUtils, db, DBTbl, DisabledFlag, H
 
 const Settings = pluginSettings('cup', {
   dataRefresh: '5s', // Check for changes and refresh publicly available data 
-  reportCooldown: '30s', // Download and complain counters won’t increment from the same user until cooldown is reached
-}, s => ({ dataRefresh: s.dataRefresh, reportCooldown: s.reportCooldown }));
+}, s => ({ dataRefresh: s.dataRefresh }));
 
 /**
  * Rules:
@@ -17,107 +16,152 @@ const Settings = pluginSettings('cup', {
  * + Flags `false`, empty lists or strings do not show up in the output
  */
 
-const tblPuts = db.table('p_puts', {
-  originKey: db.row.integer({ primary: true }),
-  createdDate: db.row.integer({ default: db.value.now, index: true }),
-});
-
 const tblCupData = db.table('p_cupdata', {
   key: db.row.text({ primary: true }),
   value: db.row.text(),
+  url: db.row.text({ nullable: true }),
+  contentKey: db.row.integer({ index: true }),
+}, { version: 3 }).extend(tbl => {
+  const pInsert = db.bound(`INSERT INTO ${tbl} (key, value, url, contentKey) VALUES (?1, ?2, ?3, ?4) 
+    ON CONFLICT(key) DO UPDATE SET value=?2, url=?3, contentKey=?4 WHERE value!=?2 OR url!=?3 OR contentKey!=?4`,
+    (s, key, data, url, contentKey) => s.run(key, data, url, contentKey).changes !== 0);
+  return {
+    getData: db.bound(`SELECT value FROM ${tbl} WHERE key=?1`, (s, key) => s.get(key)?.value),
+    getMetadata: tbl.pget(['contentKey', 'url'], 'key'),
+    getEntry: tbl.pget(['value', 'url'], 'key'),
+    setEntry(contentKey, key, dataObject, updateURL) {
+      key = key?.toLowerCase();
+      const deflated = Bun.deflateSync(JSON.stringify(dataObject));
+      if (pInsert(key, deflated, updateURL, contentKey)) {
+        Hooks.trigger('plugin.cup.update', { key, data: deflated, updateURL });
+      }
+    },
+    dropEntry(key) {
+      key = key?.toLowerCase();
+      if (tbl.delete(key) !== 0){
+        Hooks.trigger('plugin.cup.update', { key });
+      }
+    }
+  }
 });
+
+export const CUPUtils = {
+  /** @param {'countDownloads'|'countComplains'} countColumn */
+  incrementCounter(contentKey, countColumn) {
+    db.query(`UPDATE ${DBTbl.Content} SET ${countColumn}=${countColumn}+1 WHERE contentKey=?1`).run(contentKey);
+  },
+
+  getMetadata: key => tblCupData.getMetadata(key?.toLowerCase()),
+  getData: key => tblCupData.getData(key?.toLowerCase()),
+  getEntry: key => tblCupData.getEntry(key?.toLowerCase()),
+};
 
 Hooks.register('plugin.admin.tpl.toolsList', body => {
   body.push(<Co.Link action='/manage/cup/tool/cup-reset'>Reset CUP syncing</Co.Link>);
 });
 
 Server.post('/manage/cup/tool/cup-reset', $ => {
-  $.writes(Access.MODERATE);
+  $.writes(Access.ADMIN);
   Hooks.trigger('plugin.cup.reset');
   return `/manage/cup/tool`;
 });
 
 const rebuildStats = new PerfCounter();
+Hooks.register('plugin.admin.stats', fn => fn({ ['CUP syncing']: rebuildStats }));
 
-Hooks.register('plugin.admin.stats', fn => fn({
-  ['CUP syncing']: rebuildStats
-}));
-
-Hooks.register('plugin.cup.put', key => key && db.query(`INSERT OR IGNORE INTO ${tblPuts} (originKey) VALUES (?)`).run(Number(Bun.hash(key) & 0x7ffffffn)).changes === 1);
-Hooks.register('plugin.cup.data', key => db.query(`SELECT value FROM p_cupdata WHERE key=?1`).get(key)?.value);
-
-function dbUpdate(file, data, updateUrl) {
-  const r = db.query(`INSERT INTO ${tblCupData} (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value=?2 WHERE value!=?2`).run(file, Bun.deflateSync(JSON.stringify(data)));
-  if (r.changes === 1) {
-    // console.log(`Updated: ${file}`, data);
-    Hooks.trigger('plugin.cup.update', file, data, updateUrl);
-  } else {
-    Hooks.trigger('plugin.cup.update.same', file, data, updateUrl);
-  }
-}
-
-const invalidated = ContentCategories.map(() => new Map());
+const invalidated = ContentCategories.map(() => new Set());
 let listInvalidated = false;
 
 Hooks.register('core.alteration', ({ categoryIndex, contentKey, invalidateList }) => {
-  // console.log(`Altered: ${categoryIndex}/${contentKey}${invalidateList ? ' (with list)' : ''}`);
   if (typeof contentKey !== 'number') throw new Error('Invalid alteration');
-  invalidated[categoryIndex].set(contentKey, true);
+  invalidated[categoryIndex].add(contentKey);
   if (invalidateList) listInvalidated = true;
 });
 
-function rebuildList(existing) {
-  const ret = { car: {}, track: {} };
-  for (const e of db.query(`SELECT c.contentID AS contentID, c.categoryIndex AS categoryIndex, c.dataVersion AS dataVersion, c.flagLimited AS flagLimited, GROUP_CONCAT(a.contentID, "/") AS alternativeIds FROM ${DBTbl.Content} c LEFT JOIN ${DBTbl.AlternativeIDs} a ON a.contentKey=c.contentKey WHERE c.flagsDisabled=0 AND dataVersion IS NOT NULL GROUP BY c.contentKey ORDER BY c.contentID`).all()) {
-    const c = ContentCategories[e.categoryIndex].cupID;
-    const dst = ret[c] || (ret[c] = {});
-    const v = e.flagLimited ? { version: e.dataVersion, limited: true } : e.dataVersion;
-    dst[e.contentID] = v;
-    existing.set(`${c}/${e.contentID}`, true);
-    if (e.alternativeIds) {
-      for (let a of e.alternativeIds.split('/')) {
-        dst[a] = v;
-        existing.set(`${c}/${a}`, true);
+function rebuildList(present) {
+  const searchAllIndex = { 'base': {}, 'limited': {} };
+  const searchOriginalIndex = { 'base': {}, 'limited': {} };
+  const updateIndex = { car: {}, track: {} };
+  for (const e of db.query(`SELECT contentKey, contentID, categoryIndex, dataVersion, flagLimited, flagSearcheable, flagOriginal FROM ${DBTbl.Content} WHERE flagsDisabled=0`).all()) {
+    const IDs = [e.contentID, ...DBTbl.AlternativeIDs.byContentKey(e.contentKey).map(x => x.contentID)];
+    const cupID = ContentCategories[e.categoryIndex].cupID;
+    if (e.dataVersion) {
+      const updateEntry = e.flagLimited ? { version: e.dataVersion, limited: true } : e.dataVersion;
+      const updateDst = updateIndex[cupID] || (updateIndex[cupID] = {});
+      for (let a of IDs) {
+        updateDst[a] = updateEntry;
+      }
+    }
+    if (e.flagSearcheable && (e.categoryIndex === 0 || e.categoryIndex === 1)) {
+      const searchCategory = e.flagLimited ? searchAllIndex.limited : searchAllIndex.base;
+      (searchCategory[cupID] || (searchCategory[cupID] = [])).push(...IDs);
+      if (e.flagOriginal) {
+        const searchCategory = e.flagLimited ? searchOriginalIndex.limited : searchOriginalIndex.base;
+        (searchCategory[cupID] || (searchCategory[cupID] = [])).push(...IDs);
+      }
+    }
+    if (e.dataVersion || e.flagSearcheable) {
+      for (let a of IDs) {
+        present.add(`${cupID}/${a}`);
       }
     }
   }
-  return ret;
+  tblCupData.setEntry(0, '', updateIndex);
+  tblCupData.setEntry(0, 'index/all', searchAllIndex);
+  tblCupData.setEntry(0, 'index/original', searchOriginalIndex);
 }
 
 function sync(first) {
-  let count = first || listInvalidated ? 1 : 0;
+  let count = 0;
   rebuildStats.start();
 
   {
     using _ = db.write().start();
+    let present;
     if (first || listInvalidated) {
+      ++count;
       listInvalidated = false;
-      const existing = new Map();
-      dbUpdate('~', rebuildList(existing));
 
-      const files = db.query(`SELECT key FROM ${tblCupData} WHERE key!="~"`).all().filter(x => !existing.has(x.key)).map(x => x.key);
-      for (const file of files) {
-        console.log(`No longer in CUP DB: ${file}`);
-        db.query(`DELETE FROM ${tblCupData} WHERE key=?1`).run(file);
+      present = new Set();
+      rebuildList(present);
+
+      for (const file of db.query(`SELECT key FROM ${tblCupData} WHERE contentKey!=0`).all()) {
+        if (!present.has(file.key)) {
+          echo`No longer in CUP DB: _${file.key}`;
+          tblCupData.dropEntry(file.key);
+        }
       }
-
-      Hooks.trigger('plugin.cup.update.gc', existing);
     }
 
     const defaultAuthorName = new LazyMap(userKey => JSON.parse(db.query(`SELECT userData FROM ${DBTbl.Users} WHERE userKey=?1`).get(userKey).userData).dataAuthor);
     for (let categoryIndex = 0; categoryIndex < ContentCategories.length; ++categoryIndex) {
-      for (const contentKey of first ? db.query(`SELECT contentKey FROM ${DBTbl.Content} WHERE categoryIndex=?1`).all(categoryIndex).map(x => x.contentKey) : invalidated[categoryIndex].keys()) {
+      for (const contentKey of first
+        ? db.query(`SELECT contentKey FROM ${DBTbl.Content} WHERE categoryIndex=?1`).all(categoryIndex).map(x => x.contentKey)
+        : invalidated[categoryIndex].values()) {
         ++count;
-        const entry = db.query(`SELECT userKey, dataName, dataAuthor, dataVersion, flagsDisabled, flagLimited, contentID, contentData FROM ${DBTbl.Content} WHERE contentKey=?1`).get(contentKey);
-        if (entry == null || entry.flagsDisabled || !entry.dataVersion) {
+        const entry = db.query(`SELECT userKey, dataName, dataAuthor, dataVersion, flagsDisabled, flagLimited, flagSearcheable, contentID, contentData FROM ${DBTbl.Content} WHERE contentKey=?1`).get(contentKey);
+        if (entry == null || entry.flagsDisabled || !entry.dataVersion && !entry.flagSearcheable) {
           continue;
         }
-        const altIDs = db.query(`SELECT contentID FROM ${DBTbl.AlternativeIDs} WHERE contentKey=?1`).all(contentKey).map(x => x.contentID);
+
+        const cupID = ContentCategories[categoryIndex].cupID;
+        if (present && !present.has(`${cupID}/${entry.contentID}`)) {
+          echo`# Data corruption: _${cupID}/_${entry.contentID}`;
+        }
+
+        const altIDs = DBTbl.AlternativeIDs.byContentKey(contentKey).map(x => x.contentID);
         if (altIDs.some(x => !x)) {
           throw new Error(`Empty alternative ID: ${entry.contentID}, ${altIDs}`);
         }
         const contentData = JSON.parse(entry.contentData);
-        const updateUrl = Hooks.poll('data.downloadURL.straighten', contentData.updateUrl) || ContentUtils.normalizeURL(contentData.updateUrl);
+        const directUrl = Hooks.poll('data.downloadURL.straighten', contentData.updateUrl);
+        const updateUrl = directUrl != null && entry.flagLimited
+          ? ContentUtils.normalizeURL(contentData.informationUrl)
+          : (directUrl || ContentUtils.normalizeURL(contentData.updateUrl));
+        if (!updateUrl) {
+          echo`^Skipping *${cupID}/*${entry.contentID}, update URL is not set`;
+          continue;
+        }
         const baseData = {
           name: entry.dataName || undefined,
           alternativeIds: altIDs.length > 0 ? altIDs : undefined,
@@ -130,10 +174,10 @@ function sync(first) {
           limited: (entry.flagLimited != 0) || undefined,
           cleanInstallation: contentData.cleanInstallation || undefined,
         };
-        dbUpdate(`${ContentCategories[categoryIndex].cupID}/${entry.contentID}`, baseData, updateUrl);
+        tblCupData.setEntry(contentKey, `${cupID}/${entry.contentID}`, baseData, updateUrl);
         for (let a of altIDs) {
           baseData.alternativeIds = [entry.contentID, ...altIDs.filter(x => x !== a)];
-          dbUpdate(`${ContentCategories[categoryIndex].cupID}/${a}`, baseData, updateUrl);
+          tblCupData.setEntry(contentKey, `${cupID}/${a}`, baseData, updateUrl);
         }
       }
       invalidated[categoryIndex].clear();
@@ -148,13 +192,11 @@ function sync(first) {
 Hooks.register('core.started.async', () => {
   setTimeout(() => sync(true));
   setInterval(() => sync(false), Timer.ms(Settings.dataRefresh));
-  setInterval(() => db.query(`DELETE FROM ${tblPuts} WHERE createdDate < ?1`).run(+db.value.now - Timer.seconds(Settings.reportCooldown)), Timer.ms(Settings.reportCooldown) * 0.2);
 }, 1e9);
 
 Hooks.register('plugin.cup.reset', () => {
   using _ = db.write().start();
-  db.query(`DELETE FROM ${tblPuts}`).run();
-  db.query(`DELETE FROM ${tblCupData}`).run();
+  tblCupData.clear();
   setTimeout(() => sync(true));
 });
 
