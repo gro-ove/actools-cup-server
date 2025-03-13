@@ -132,6 +132,12 @@ header{position:sticky;top:0;z-index:1;background:var(--bg);border-bottom:var(--
 
 .attention{border:2px dashed var(--accent-good);padding:8px;margin:6px 0 20px 160px}
 
+.collapsing-float:not(.collapsing-active)+*{display:none}
+.collapsing-float{cursor:pointer;}
+.collapsing-float:before{content:"▶";display:inline-block;width:12px}
+.collapsing-float.collapsing-active:before{content:"▼"}
+.collapsing-float.collapsing-active:after{content:":"}
+
 @media (prefers-color-scheme:dark){
   :root{--bg:#111;--input-bg:#222;--text-color:#fff;--accent-warn:#f77;--accent-good:#7f7;--link:#7af;--separator:#fff8}
 }

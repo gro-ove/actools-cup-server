@@ -306,7 +306,7 @@ Server.get('/manage/:categoryID/:contentID', $ => {
     <li><Co.Value title="countDownloads">Downloads: {entry.countDownloads}</Co.Value></li>
     <li><Co.Value title="countComplains">Complains: {entry.countComplains}</Co.Value></li>
   </>, entry.flagsDisabled === 0 && contentData.updateUrl && !entry.flagLimited
-    ? <Co.Link href={U`/registry/${$.params.categoryID}/${entry.contentID}/get`} title="You can use this URL for a quick download on your website or social media to count downloads" onclick={`navigator.clipboard.writeText(this.href);this.textContent="Download URL copied"`}>Copy download URL</Co.Link>
+    ? <Co.Link href={U`/registry/${ContentCategories[$.categoryIndex].cupID}/${entry.contentID}/get`} title="You can use this URL for a quick download on your website or social media to count downloads" onclick={`navigator.clipboard.writeText(this.href);this.textContent="Download URL copied"`}>Copy download URL</Co.Link>
     : <Co.Link disabled title="Download URLs won’t work for disabled, hidden, blocked entries, or entries being processed">Download URL is not available</Co.Link>);
 
   const alternativeIds = db.query(`SELECT * FROM ${DBTbl.AlternativeIDs} WHERE contentKey=?1`).all(entry.contentKey).map(x => x.contentID);
@@ -773,7 +773,7 @@ Server.get('/', $ => new Response(formatGenericPage($, <Co.Page title="Hello Wor
       <Co.Link href="/manage">CUP</Co.Link>
     </Co.InlineMenu>
   </p>
-</Co.Page>), { headers: { 'Content-Type': 'text/html; charset=UTF-8', 'Cache-Control': 'max-age=3600, public' } }));
+</Co.Page>), { headers: { 'Content-Type': 'text/html; charset=UTF-8', 'Cache-Control': 'max-age=3600, private' } }));
 
 // Resources:
 {
@@ -795,6 +795,6 @@ Server.get('/', $ => new Response(formatGenericPage($, <Co.Page title="Hello Wor
   if (AppSettings.core.monitorResources) {
     fs.watch(AppSettings.core.resDir, { recursive: true }, () => filesCache.clear());
   }
-  Server.zone('/res', { handle: (req, url) => filesCache.get(url.pathname.substring(5))() });
+  Server.zone('/res', { handle: (req, url) => filesCache.get(url.pathname.substring(5).replace(/^\/+|(?<=\/)\/+|\/+$/g, ''))() });
   Server.get('/favicon.ico', $ => filesCache.get('favicon.ico')());
 }

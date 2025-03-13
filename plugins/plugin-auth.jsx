@@ -4,9 +4,11 @@ import { CookieHandler, jsExt, Sqid, Timer } from '../src/std';
 
 const Settings = pluginSettings('auth', {
   sessionTokenKey: null,
-  sessionMaxAge: `30 days`
+  sessionMaxAge: `30 days`,
+  sessionDifferentIPMaxAge: `1 day`,
 }, s => ({
-  sessionMaxAge: s.sessionMaxAge
+  sessionMaxAge: s.sessionMaxAge,
+  sessionDifferentIPMaxAge: s.sessionDifferentIPMaxAge,
 }));
 
 const tblSessions = db.table('p_auth', {
@@ -73,7 +75,7 @@ function removeCurrentSession($) {
 function removeOtherSessions($) {
   const read = tblSessions.decode($.cookies.get('CupManageAuth'));
   if (read) {
-    db.query(`DELETE FROM ${tblSessions} WHERE sessionKey IS NOT ?1 AND userKey=?2`).run(sessionKey, $.user.userKey);
+    db.query(`DELETE FROM ${tblSessions} WHERE sessionKey IS NOT ?1 AND userKey=?2`).run(read.key, $.user.userKey);
   }
 }
 
@@ -138,7 +140,7 @@ Hooks.register('core.user.auth', /** @param {Ctx} $ */ $ => {
   const ip = $.requestIP;
   const browser = getBrowserID($);
   if (ip !== session.lastIP) {
-    if (browser !== session.lastBrowser || isDevSession) {
+    if (browser !== session.lastBrowser || isDevSession || ageS > Timer.seconds(Settings.sessionDifferentIPMaxAge)) {
       tblSessions.deleteSession(read.key);
       return null;
     }

@@ -426,8 +426,8 @@ BunJSX.configure({
   groupTagName: 'G',
   allowEmptyTag: true,
   attributeHandlers: {
-    $id: v => { 
-      curCtx.get().__pushedID = v; 
+    $id: v => {
+      curCtx.get().__pushedID = v;
     },
     $hook: (v, b) => {
       // BunJSX templates can easily trigger hook events
@@ -752,7 +752,10 @@ export class Ctx {
   }
 
   get categoryIndex() {
-    return categoryIDToIndex[this.params.categoryID];
+    const ret = categoryIDToIndex[this.params.categoryID];
+    if (ret != null) return ret;
+    console.warn(this.params.categoryID, categoryIDToIndex);
+    throw new Error(this.params.categoryID ? `Unknown category ID: ${this.params.categoryID}` : 'Missing category ID parameter');
   }
 
   get signed() {
@@ -1076,7 +1079,7 @@ export const Co = {
     },
     End(props, body) {
       if (!body.length) return new BunJSX(`</form>`);
-      return new BunJSX(<input class="link good" type="submit" form="mainForm" data-submit-always-enabled={props.active} value={body} /> + `</form>`);
+      return new BunJSX(<input class="link good" name={props.name} type="submit" form="mainForm" data-submit-always-enabled={props.active} value={body} /> + `</form>`);
     },
     Submit(props, body) {
       return <form><input class="link good" name={props.name} type="submit" form="mainForm" data-submit-always-enabled={props.active} value={body} /></form>;
@@ -1136,7 +1139,7 @@ export const Co = {
       return <a href={h || '#'} title={title} class={className} onclick={`${props.onclick};return false`}>{body}</a>;
     }
 
-    return h || className ? <a href={h} title={title} class={className} 
+    return h || className ? <a href={h} title={title} class={className}
       data-selected={typeof props['data-selected'] === 'boolean' || props['data-selected'] ? props['data-selected'] : h === curCtx.get().url.pathname}>{body}</a> : body;
   },
 
@@ -1204,8 +1207,8 @@ Hooks.register('core.tpl.userMenu', body => {
 }, Infinity);
 
 // Errors collection
-function collectError(error, $) {
-  Hooks.trigger('core.error', { error, $ });
+function collectError(error, $, extras) {
+  Hooks.trigger('core.error', { error, $, extras });
 }
 
 // HTTP server
@@ -1395,20 +1398,22 @@ function fixHeadyRequests(req, res) {
   return res;
 }
 
+let lastRequestURL;
 export async function appStart() {
   await Hooks.async('core.starting.async');
-  Bun.serve({
-    port: AppSettings.core.httpPort,
+  Bun.serve(Object.assign({
     fetch(req, server) {
+      lastRequestURL = req?.url;
       const url = new URL(req.url);
+      Hooks.trigger('core.url', url);
       return fixHeadyRequests(req, Zone.find(url.pathname).handle(req, url, server));
     },
     error(error) {
-      echo`#Serve error: =${error}`;
-      collectError(error, null);
+      echo`#Serve error (last request URL: _${lastRequestURL || '?'}): =${error}`;
+      collectError(error, null, { lastRequestURL });
       return new Response(process.platform === 'win32' ? error.stack || error : 'Internal error', { status: 500, headers: { 'Content-Type': 'text/plain; charset=UTF-8', 'Connection': 'close' } });
     },
-  });
+  }, typeof AppSettings.core.httpPort === 'number' ? { port: AppSettings.core.httpPort} : { unix: AppSettings.core.httpPort }));
   echo`Running server on :^${AppSettings.core.httpPort} port`;
   await Hooks.async('core.started.async');
   if (AppSettings.admin && AppSettings.admin.userID

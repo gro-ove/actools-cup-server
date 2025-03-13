@@ -177,6 +177,10 @@ function closeToast(e) {
 
 // Dropdown lists:
 window.addEventListener('click', e => {
+  if (e.target.classList && e.target.classList.contains('collapsing-float')) {
+    e.target.classList.toggle('collapsing-active');
+    e.preventDefault();
+  }
   if (e.target.tagName === 'A' && e.target.parentNode && e.target.parentNode.classList && e.target.parentNode.classList.contains('dropdown')) {
     e.target.parentNode.classList.toggle('dropdown-active');
     e.preventDefault();

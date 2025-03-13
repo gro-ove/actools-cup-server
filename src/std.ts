@@ -92,7 +92,7 @@ let __installBusy: Busy | null = null;
 /** Some extra niceties to deal with JavaScript. */
 export const jsExt = {
   disposable(fn: Function) { return { [Symbol.dispose]: fn }; },
-  raiseError(err: Error) { throw err; },
+  raiseError(err: string | Error) { throw typeof err === 'string' ? new Error(err) : err; },
   tryCall<T, TErr>(fn: () => T, fnCatch: null | ((err: Error) => TErr) = null, fnFinally: null | Function = null): T | TErr | null { try { return fn(); } catch (e) { return fnCatch && fnCatch(e); } finally { fnFinally && fnFinally(); } },
   async tryCallAsync<T, TErr>(fn: () => T, fnCatch: null | ((err: Error) => TErr) = null, fnFinally: null | Function = null) { try { return await fn(); } catch (e) { return fnCatch && await fnCatch(e); } finally { fnFinally && fnFinally(); } },
 
@@ -836,6 +836,8 @@ CREATE TABLE IF NOT EXISTS __sto (key TEXT PRIMARY KEY, value TEXT);`);
    * upgrade functions defines table version. If table version is 2, but third function is added, only third one will be called.
    */
   table<T extends Record<string, DatabaseRow<any>>>(name: string, rows: T, props: (null | { order: string | null, indices: { columns: string[], unique: boolean | null }[], upgrade: ((old: T) => T)[] | null, version: number | null, temporary: boolean | null }) = null) {
+    if (this.#cache.knownTables.has(name)) throw new Error(`Table ${name} is already created`);
+    this.#cache.knownTables.add(name);
     return new ExtendedDatabase.#Table(this, name, rows, props);
   }
 

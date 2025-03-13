@@ -19,19 +19,23 @@ const tblErrors = db.table('t_collected_errors', {
   createdDate: db.row.integer({ default: db.value.now }),
 });
 
-Hooks.register('core.error', ({ error, $ }) => {
+Hooks.register('core.error', ({ error, $, extras }) => {
   if (tblErrors.count() > Settings.errorReportsLimit
     || db.storage.get(KEY_PAUSE_ERRORS_COLLECTION) === true
     || error instanceof RequestError) return;
+  let data;
+  try {
+    data = `${error && error.stack || error}
+${JSON.stringify($?.req ? { method: $.req.method, headers: Object.fromEntries($.req.headers), params: $.params, extras } : { extras })}`;
+  } catch (e) {
+    echo`!Error reporting error:=${e}`;
+    data = '' + e + '\n(Error reporting error!)';
+  }
   tblErrors.insert({
-    url: $?.req?.url,
+    url: $?.req?.url || extras?.lastRequestURL,
     userID: $?.__user?.userID,
-    data: $
-      ? `${error && error.stack || error}\n
-Method: ${$.req?.method || '?'}
-Headers: ${$.req?.headers && JSON.stringify([...$.req.headers.keys()].reduce((p, x) => ((p[x] = $.req.headers.get(x)), p), {}), null, 2)}`
-      : `${error && error.stack || error}\n(Bun serve error.)`,
-    createdDate: Date.now() / 1e3
+    data,
+    createdDate: +db.value.now
   });
 });
 
@@ -110,7 +114,7 @@ Server.get('/manage/cup', $ => {
       <hr />
       <h3>Action test:</h3>
       <li><Co.Link action={() => $.toast(null, 'Hello world! Value: ' + $.params.got)}>Test</Co.Link></li>
-      <li><Co.Link action={$ => $.toast(null, 'Now: ' + key + ', was: ' + $.params.key)} args={{key}}>Random: {key}</Co.Link></li>
+      <li><Co.Link action={$ => $.toast(null, 'Now: ' + key + ', was: ' + $.params.key)} args={{ key }}>Random: {key}</Co.Link></li>
       <li><Co.Link action={() => $.toast(null, 'URL: ' + $.requestURL)}>Get URL</Co.Link></li>
     </ul>
   </Co.Page>;
@@ -216,21 +220,41 @@ const cmdDeleteByURL = Server.command(url => db.query(`DELETE FROM ${tblErrors} 
 const cmdDeleteByMessage = Server.command(message => db.query(`DELETE FROM ${tblErrors} WHERE data LIKE ?1`).run(message + '\n%'));
 const cmdToggleErrorsCollection = Server.command(() => db.storage.set(KEY_PAUSE_ERRORS_COLLECTION, !db.storage.get(KEY_PAUSE_ERRORS_COLLECTION)));
 const cmdClearErrors = Server.command(() => tblErrors.clear());
+
+function errToData(err) {
+  const s = err.indexOf('\n{');
+  if (s !== -1) {
+    try {
+      let j = JSON.parse(err.substring(s + 1));
+      let a = err.substring(0, s).split('\n');
+      return [<div style="margin:1em 0">
+        <span class="mono">{a[0]}</span>
+        {a.length > 1 ? <>
+          <span class="collapsing-float" style="font-size:0.8em;margin-right:1em">Stack ({a.length - 1})</span>
+          <pre style="margin:0.6em 20px">{a.slice(1).map(x => x.trim()).join('\n')}</pre>
+        </> : null}
+        {j.extras && Object.keys(j.extras).length > 0 ? <>
+          <span class="collapsing-float" style="font-size:0.8em;margin-right:1em">Extras ({Object.keys(j.extras).length})</span>
+          <pre style="margin:0.6em 20px">{JSON.stringify(j.extras, null, 2).replace(/^\{|(?<!:) +(?=")|\}$/g, '').trim()}</pre>
+        </> : null}
+        {j.params && Object.keys(j.params).length > 0 ? <>
+          <span class="collapsing-float" style="font-size:0.8em;margin-right:1em">Params ({Object.keys(j.params).length})</span>
+          <pre style="margin:0.6em 20px">{JSON.stringify(j.params, null, 2).replace(/^\{|(?<!:) +(?=")|\}$/g, '').trim()}</pre>
+        </> : null}
+        {j.headers && Object.keys(j.headers).length > 0 ? <>
+          <span class="collapsing-float" style="font-size:0.8em;margin-right:1em">Headers ({Object.keys(j.headers).length})</span>
+          <pre style="margin:0.6em 20px">{JSON.stringify(j.headers, null, 2).replace(/^\{|(?<!:) +(?=")|\}$/g, '').trim()}</pre>
+        </> : null}
+      </div>, j.method];
+    } catch (e) {
+      console.log(e);
+    }
+  }
+  return [<pre class="details">{err}</pre>, null];
+}
+
 Server.get('/manage/cup/errors', $ => {
   $.writes(Access.ADMIN);
-  const list = $.liveUpdating('30 s', <ul class="form">
-    {db.query(`SELECT * FROM ${tblErrors} ORDER BY -createdDate`).all().map(x => <li data-search={x.data}>
-      <Co.InlineMenu>
-        <Co.Date value={x.createdDate} />
-        {x.url ? <Co.Link href={x.url}>{x.url.replace(/^[^\/]+\/\/[^\/]+\//, '/')}</Co.Link> : null}
-        {x.userID ? <Co.UserLink userID={x.userID} /> : null}
-        <Co.Link action={cmdDeleteByDate(x.createdDate)} data-live-apply>remove</Co.Link>
-        {x.url ? <Co.Link action={cmdDeleteByURL(x.url)} data-live-apply>remove by URL</Co.Link> : null}
-        {x.data.indexOf('\n') !== -1 ? <Co.Link action={cmdDeleteByMessage(x.data.split('\n', 1)[0])} data-live-apply>remove by message</Co.Link> : null}
-      </Co.InlineMenu>
-      <pre class="details">{x.data}</pre>
-    </li>)}
-  </ul>);
   return <Co.Page title="Errors" search>
     <ul class="form">
       <Co.InlineMenu>
@@ -239,7 +263,23 @@ Server.get('/manage/cup/errors', $ => {
       </Co.InlineMenu>
       <hr />
     </ul>
-    {list[0]}
+    <ul class="form">
+      {db.query(`SELECT * FROM ${tblErrors} ORDER BY -createdDate`).all().map(x => {
+        const [err, method] = errToData(x.data);
+        return <li data-search={x.data}>
+          <Co.InlineMenu>
+            <Co.Date value={x.createdDate} />
+            {method || null}
+            {x.url ? <Co.Link href={x.url}>{x.url.replace(/^[^\/]+\/\/[^\/]+\//, '/')}</Co.Link> : null}
+            {x.userID ? <Co.UserLink userID={x.userID} /> : null}
+            <Co.Link action={cmdDeleteByDate(x.createdDate)}>remove</Co.Link>
+            {x.url ? <Co.Link action={cmdDeleteByURL(x.url)}>remove by URL</Co.Link> : null}
+            {x.data.indexOf('\n') !== -1 ? <Co.Link action={cmdDeleteByMessage(x.data.split('\n', 1)[0])}>remove by message</Co.Link> : null}
+          </Co.InlineMenu>
+          {err}
+        </li>
+      })}
+    </ul>
   </Co.Page>;
 });
 

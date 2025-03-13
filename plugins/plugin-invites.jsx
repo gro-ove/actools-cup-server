@@ -34,7 +34,7 @@ Server.get('/manage/tool/invite', $ => {
       <Co.Row key="allowedFilter" attributes={{ class: 'mono' }}>ID filter</Co.Row>
       <hr />
       <Co.InlineMenu>
-        <Co.MainForm.End>Create an invite</Co.MainForm.End>
+        <Co.MainForm.End active>Create an invite</Co.MainForm.End>
       </Co.InlineMenu>
     </ul>
   </Co.Page>;
@@ -102,23 +102,32 @@ Server.get('/manage/invite/:inviteKey', $ => {
 
   if ($.signed) {
     const inviteData = JSON.parse(data.inviteData);
+    const editable = data.claimedUserKey == null && $.can(Access.MODERATE);
     return <Co.Page title="Invite to a CUP v2">
       <ul class="form">
+        {editable ? <Co.MainForm.Start /> : null}
         <p>{data.claimedUserKey != null
           ? <>Invite claimed by <Co.UserLink userKey={data.claimedUserKey} /> <Co.Date value={db.query(`SELECT createdDate FROM ${DBTbl.Users} WHERE userKey=?1`).get(data.claimedUserKey).createdDate} />.</>
           : <>Unclaimed invite{data.invitedUserID ? ` for ${data.invitedUserID} ` : null}.</>}</p>
         <li>Created: <Co.Date value={data.createdDate} /></li>
         <li>Created by: <Co.UserLink userID={inviteData.inviteeUserID} /></li>
-        {$.can(Access.MODERATE) ? <li>Invite mark: <Co.FormattedMessage value={inviteData.inviteMark} /></li> : null}
+        {!$.can(Access.MODERATE) ? null : editable 
+          ? <Co.Row data={inviteData} key="inviteMark">Invite mark</Co.Row>
+          : <li>Invite mark: <Co.FormattedMessage value={inviteData.inviteMark} /></li>}
         <h3>Account access:</h3>
-        <li>Permissions: <Co.PermissionsList value={inviteData.accessMask} short /></li>
-        <li>ID filter: <Co.Value placeholder="any" mono>{inviteData.allowedFilter}</Co.Value></li>
+        {editable ? <>
+          <Co.Row accessMask={inviteData.accessMask}>Permissions</Co.Row>
+          <Co.Row data={inviteData} key="allowedFilter" attributes={{ class: 'mono' }}>ID filter</Co.Row>
+        </> : <>
+          <li>Permissions: <Co.PermissionsList value={inviteData.accessMask} short /></li>
+          <li>ID filter: <Co.Value placeholder="any" mono>{inviteData.allowedFilter}</Co.Value></li>
+        </>}
         <hr />
         <Co.InlineMenu>
-          <a href={`data:text/plain;base64,${btoa($.requestURL)}`} onclick={`navigator.clipboard.writeText(${JSON.stringify($.requestURL)});this.textContent="URL copied";return false`}>Copy URL</a>
+          {editable ? <Co.MainForm.End name="edit-invite">Save changes</Co.MainForm.End> : null}
+          {$.can(Access.MODERATE) ? <a href={`data:text/plain;base64,${btoa($.requestURL)}`} onclick={`navigator.clipboard.writeText(${JSON.stringify($.requestURL)});this.textContent="URL copied";return false`}>Copy URL</a> : null}
           <Co.Link action="/manage/command/logout" args={{ location: 'current' }}>Log out to claim</Co.Link>
-          {$.can(Access.MODERATE) ? <Co.Link href="/manage/tool/invite">Invite a user…</Co.Link> : null}
-          {$.can(Access.MODERATE) ? <Co.Link action="/manage/command/invite-delete" args={{ inviteKey: data.inviteKey }} query="Are you sure to completely delete an invite?">Delete invite…</Co.Link> : null}
+          {$.can(Access.ADMIN) || editable ? <Co.Link action="/manage/command/invite-delete" args={{ inviteKey: data.inviteKey }} query="Are you sure to completely delete an invite?">Delete invite…</Co.Link> : null}
         </Co.InlineMenu>
       </ul>
     </Co.Page>;
@@ -156,6 +165,18 @@ Server.post('/manage/invite/:inviteKey', $ => {
   if (!data) {
     throw $.requestError('No invite with such ID found');
   }
+  const inviteData = JSON.parse(data.inviteData);
+  if ($.params['edit-invite']) {
+    const newMask = Object.values(Access).filter(x => $.params[`perm-${x}`] === 'on' && $.canSetPermission(x)).reduce((p, v) => p | v, 0);
+    $.writes($.user.userID != inviteData.inviteeUserID ? Access.ADMIN : Access.MODERATE);
+    Object.assign(inviteData, $.form({
+      inviteMark: db.row.text(),
+      allowedFilter: db.row.text(),
+      accessMask: newMask
+    }));
+    tblInvites.update(data.inviteKey, { inviteData: JSON.stringify(inviteData) });
+    return '/~';
+  }
   if ($.signed) {
     if ($.user.userKey === data.claimedUserKey) return '/manage';
     throw $.requestError('You already are signed in', <Co.Link action="/manage/command/logout" args={{ location: 'current' }}>Log out and try again</Co.Link>);
@@ -164,7 +185,6 @@ Server.post('/manage/invite/:inviteKey', $ => {
     throw $.requestError(<>Invite has already been claimed by <Co.UserLink userKey={data.claimedUserKey} /></>);
   }
 
-  const inviteData = JSON.parse(data.inviteData);
   const userID = data.invitedUserID || $.params['data-userID'];
   if (userID !== Utils.idfy(userID, false)) {
     throw $.requestError(`Incorrect user ID`);
@@ -193,6 +213,9 @@ Server.post('/manage/command/invite-delete', $ => {
   $.writes(Access.MODERATE);
   const data = tblInvites.get($.params.inviteKey);
   if (!data) return null;
+  if (data.claimedUserKey && !$.can(Access.ADMIN)) {
+    throw $.requestError(`Can’t delete claimed invite`);
+  }
   $.undo(`Invite #${data.inviteKey.toString(36)} erased.`, () => {
     const restoredKey = tblInvites.insert(data);
     if (data.claimedUserKey) {
